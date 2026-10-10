@@ -294,6 +294,65 @@ pub(crate) enum SourceCheckpointDecision {
     },
 }
 
+/// Capture the owning decision without serializing its provider token.
+pub(crate) fn checkpoint_support_fields(decision: &SourceCheckpointDecision) -> serde_json::Value {
+    match decision {
+        SourceCheckpointDecision::Advance { basis, .. } => serde_json::json!({
+            "decision":"advanced", "basis":basis.as_str(), "recovery":"none"
+        }),
+        SourceCheckpointDecision::Preserve { reason, recovery } => serde_json::json!({
+            "decision":"preserved", "reason":reason.as_str(), "recovery":recovery.as_str()
+        }),
+    }
+}
+
+fn observe_sync_component(
+    zone: &str,
+    component: &'static str,
+    result: &download::SyncResult,
+    passes: usize,
+) {
+    crate::support::observe_scoped(
+        zone,
+        None,
+        "support_pass_completion_v1",
+        serde_json::json!({
+            "component":component, "count_scope":"selected_invocation", "passes":passes,
+            "phase":if result.full_enumeration_ran {"full"} else {"incremental"},
+            // These totals describe this invocation, before any bridge composition.
+            // Query EOF evidence is recorded by the provider fetcher, not inferred
+            // from absence of reported errors or widened into inventory coverage.
+            "inventory_complete":serde_json::Value::Null,
+            "selection_comparable":serde_json::Value::Null,
+            "enumeration_incomplete":result.checkpoint.enumeration_incomplete,
+            "enumeration_errors":result.checkpoint.enumeration_errors,
+            "identity_incomplete":result.checkpoint.identity_incomplete,
+            "interrupted":result.checkpoint.interrupted,
+            "api_total":result.stats.api_total_at_start, "assets_seen":result.stats.assets_seen,
+            "outcome":match result.outcome {
+                download::DownloadOutcome::Success => "success",
+                download::DownloadOutcome::SessionExpired { .. } => "session_expired",
+                download::DownloadOutcome::PartialFailure { .. } => "partial_failure",
+            },
+            "token_present":result.sync_token.is_some(),
+            "token_usable":result.sync_token.as_ref().is_some_and(|token| !token.trim().is_empty()),
+            "sync_token_blocked":result.checkpoint.sync_token_blocked,
+            "sync_token_blocked_reason":result.stats.sync_token_blocked_reason,
+            "sync_token_blocked_source":result.stats.sync_token_blocked_source,
+            "sync_token_expected_receivers":result.stats.sync_token_expected_receivers,
+            "sync_token_receivers_with_token":result.stats.sync_token_receivers_with_token,
+            "sync_token_receivers_missing":result.stats.sync_token_receivers_missing,
+            "sync_token_receivers_blank":result.stats.sync_token_receivers_blank,
+            "sync_token_receivers_dropped":result.stats.sync_token_receivers_dropped,
+            "sync_token_unique_values":result.stats.sync_token_unique_values,
+            "same_cycle_recovery_attempts":result.stats.same_cycle_recovery_attempts,
+            "same_cycle_recovery_successes":result.stats.same_cycle_recovery_successes,
+            "completed_delta_replay":result.checkpoint.completed_delta_replay,
+            "retained_token_rejected":result.checkpoint.retained_token_rejected,
+        }),
+    );
+}
+
 fn source_checkpoint_decision(
     result: &download::SyncResult,
     dry_run: bool,
@@ -1241,6 +1300,13 @@ pub(crate) async fn run_cycle(
         )
         .await?;
 
+        observe_sync_component(
+            &lib_state.zone_name,
+            "initial",
+            &sync_result,
+            lib_state.plan.passes.len(),
+        );
+
         if legacy_cycle.requires_inventory()
             && sync_result.full_enumeration_ran
             && matches!(
@@ -1329,6 +1395,12 @@ pub(crate) async fn run_cycle(
                         shutdown_token.clone(),
                     )
                     .await?;
+                    observe_sync_component(
+                        &lib_state.zone_name,
+                        "delta_bridge",
+                        &bridge_result,
+                        lib_state.plan.passes.len(),
+                    );
                     let bridge_decision = source_checkpoint_decision(
                         &bridge_result,
                         config.runtime.dry_run,
@@ -1564,6 +1636,8 @@ pub(crate) async fn run_cycle(
                 && sync_result.checkpoint.state_write_failures == 0
                 && !legacy_cycle.requires_inventory()));
 
+        let mut checkpoint_evidence = checkpoint_support_fields(&checkpoint_decision);
+        let mut checkpoint_persistence = "no_state_db";
         match checkpoint_decision {
             SourceCheckpointDecision::Advance { token, basis } => {
                 crate::metrics::record_checkpoint_decision("advanced", basis.as_str());
@@ -1607,6 +1681,9 @@ pub(crate) async fn run_cycle(
                                 error = %e,
                                 "Failed to retain completed zone reconciliation checkpoint"
                             );
+                            checkpoint_persistence = "failed";
+                        } else {
+                            checkpoint_persistence = "staged_reconciliation";
                         }
                     } else {
                         let mut metadata_updates = vec![(lib_state.sync_token_key.clone(), token)];
@@ -1649,7 +1726,9 @@ pub(crate) async fn run_cycle(
                             db_sync_token_advance_safe = false;
                             path_reconciliation_cycle_safe = false;
                             tracing::warn!(error = %e, "Failed to store provider checkpoint");
+                            checkpoint_persistence = "failed";
                         } else {
+                            checkpoint_persistence = "stored";
                             if cycle_has_stale_plan && !lib_state.plan_is_stale {
                                 tracing::warn!(
                                     zone = %lib_state.zone_name,
@@ -1705,6 +1784,9 @@ pub(crate) async fn run_cycle(
                 {
                     path_reconciliation_cycle_safe = false;
                     tracing::debug!(error = %e, "Failed to persist checkpoint hold status");
+                    checkpoint_persistence = "failed";
+                } else if state_db.is_some() {
+                    checkpoint_persistence = "stored_hold";
                 }
                 let diagnostic = sync_result
                     .stats
@@ -1725,6 +1807,50 @@ pub(crate) async fn run_cycle(
             }
         }
 
+        if let Some(fields) = checkpoint_evidence.as_object_mut() {
+            fields.insert(
+                "persistence".into(),
+                serde_json::json!(checkpoint_persistence),
+            );
+            fields.insert(
+                "token_present".into(),
+                serde_json::json!(sync_result.sync_token.is_some()),
+            );
+            fields.insert(
+                "full_enumeration".into(),
+                serde_json::json!(sync_result.full_enumeration_ran),
+            );
+            fields.insert(
+                "identity_incomplete".into(),
+                serde_json::json!(sync_result.checkpoint.identity_incomplete),
+            );
+            fields.insert(
+                "state_write_failures".into(),
+                serde_json::json!(sync_result.checkpoint.state_write_failures),
+            );
+            fields.insert(
+                "enumeration_errors".into(),
+                serde_json::json!(sync_result.checkpoint.enumeration_errors),
+            );
+            if checkpoint_persistence == "failed" {
+                fields.insert(
+                    "recovery".into(),
+                    serde_json::json!("replay_from_prior_token"),
+                );
+            }
+        }
+        crate::support::observe_scoped(
+            &lib_state.zone_name,
+            None,
+            "support_checkpoint_v1",
+            checkpoint_evidence,
+        );
+        observe_sync_component(
+            &lib_state.zone_name,
+            "combined",
+            &sync_result,
+            lib_state.plan.passes.len(),
+        );
         if sync_result.stats.sync_token_blocked
             && sync_result.stats.sync_token_blocked_zone.is_none()
         {
@@ -2050,6 +2176,49 @@ pub(crate) fn hash_legacy_preservation_policy(
 mod tests {
     use super::*;
     use crate::commands::PassKind;
+
+    #[test]
+    fn support_component_totals_keep_inventory_and_bridge_separate() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let (layer, drain) = crate::support::history::test_layer();
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+            let mut inventory = download::SyncResult::from_execution(
+                download::DownloadOutcome::Success,
+                Some("PRIVATE_TOKEN".into()),
+                download::SyncStats {
+                    assets_seen: 3899,
+                    api_total_at_start: Some(3899),
+                    ..Default::default()
+                },
+            );
+            inventory.full_enumeration_ran = true;
+            let bridge = download::SyncResult::from_execution(
+                download::DownloadOutcome::Success,
+                Some("PRIVATE_SUCCESSOR".into()),
+                download::SyncStats {
+                    assets_seen: 238,
+                    api_total_at_start: Some(238),
+                    ..Default::default()
+                },
+            );
+            observe_sync_component("PRIVATE_ZONE", "initial", &inventory, 1);
+            observe_sync_component("PRIVATE_ZONE", "delta_bridge", &bridge, 1);
+            inventory.accumulate(&bridge);
+            observe_sync_component("PRIVATE_ZONE", "combined", &inventory, 1);
+        });
+        let evidence = drain();
+        assert_eq!(evidence.len(), 3);
+        assert_eq!(evidence[0]["fields"]["assets_seen"], 3899);
+        assert_eq!(evidence[1]["fields"]["assets_seen"], 238);
+        assert_eq!(evidence[2]["fields"]["assets_seen"], 4137);
+        assert_eq!(evidence[0]["fields"]["component"], "initial");
+        assert!(evidence[2]["fields"]["inventory_complete"].is_null());
+        assert!(
+            !serde_json::to_string(&evidence)
+                .unwrap()
+                .contains("PRIVATE")
+        );
+    }
 
     #[test]
     fn retained_checkpoint_hold_round_trip_and_version_one_migration() {
