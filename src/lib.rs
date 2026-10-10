@@ -655,6 +655,17 @@ impl Drop for PidFileGuard {
 /// of the lib so it's reachable from integration tests, fuzz harnesses,
 /// and any future companion binaries.
 pub fn main_inner() -> ExitCode {
+    // Private packaging query: classify argv without credential resolution,
+    // runtime or configuration reads. Status 0 means export, 1 means ordinary
+    // command; unexpected process failure must stop wrapper initialization.
+    if std::env::var_os("KEI_DOCKER_ENTRYPOINT_QUERY").as_deref() == Some(std::ffi::OsStr::new("1"))
+    {
+        return if cli::is_support_export_invocation(std::env::args_os()) {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(1)
+        };
+    }
     let input_mode = InputMode::detect();
 
     // Snapshot and scrub the password env var while truly single-threaded,
