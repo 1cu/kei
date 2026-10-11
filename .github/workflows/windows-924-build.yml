@@ -1,0 +1,209 @@
+name: Windows test build for issue 924
+
+on:
+  push:
+    branches: [automation/windows-924-30fe9ec]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-924-30fe9ec
+  cancel-in-progress: false
+
+env:
+  SOURCE_REVISION: 30fe9ecab01899e9d1c846958f04cd8b7e526a2d
+  SOURCE_TREE: 23f11609438cfb58db071f7b6b55fcd910d5fb9c
+  RUSTUP_TOOLCHAIN: '1.94.1'
+  CARGO_BUILD_JOBS: '2'
+  CARGO_TERM_COLOR: never
+
+jobs:
+  build:
+    if: >-
+      github.repository == 'rhoopr/kei' &&
+      github.actor == 'rhoopr' &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/automation/windows-924-30fe9ec' &&
+      github.event.created == true &&
+      github.event.before == '0000000000000000000000000000000000000000' &&
+      github.run_attempt == 1
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: source
+    steps:
+      - name: Preserve LF checkout bytes
+        working-directory: ${{ github.workspace }}
+        run: |
+          git config --global core.autocrlf false
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot disable checkout conversion' }
+          git config --global core.eol lf
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot select LF checkout' }
+
+      - name: Check out pinned product source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: rhoopr/kei
+          ref: 30fe9ecab01899e9d1c846958f04cd8b7e526a2d
+          path: source
+          persist-credentials: false
+
+      - name: Check out this workflow commit separately
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: rhoopr/kei
+          ref: ${{ github.sha }}
+          path: handoff
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Build, smoke-check and verify the test package
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          function Git-Text($directory, $arguments) {
+            $output = & git -C $directory @arguments 2>&1
+            if ($LASTEXITCODE -ne 0) { throw 'Git verification failed' }
+            return ($output | Out-String).Trim()
+          }
+          function Check-Checkout($directory, $head, $tree) {
+            if ((Git-Text $directory @('rev-parse', 'HEAD')) -cne $head) { throw 'Commit differs' }
+            $actualTree = Git-Text $directory @('rev-parse', 'HEAD^{tree}')
+            if ($tree -and $actualTree -cne $tree) { throw 'Tree differs' }
+            if (Git-Text $directory @('status', '--porcelain', '--untracked-files=all')) { throw 'Checkout is dirty' }
+            return $actualTree
+          }
+          function Hash($path) { return (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() }
+          function Smoke($binary, $arguments, $log) {
+            & $binary @arguments > $log 2>&1
+            if ($LASTEXITCODE -ne 0) { throw 'Binary smoke command failed' }
+            $output = Get-Content -LiteralPath $log -Raw -Encoding utf8
+            if ([string]::IsNullOrWhiteSpace($output)) { throw 'Empty smoke output' }
+            return $output.TrimEnd([char[]]"`r`n")
+          }
+          $source = Join-Path $env:GITHUB_WORKSPACE 'source'
+          $handoff = Join-Path $env:GITHUB_WORKSPACE 'handoff'
+          Check-Checkout $source $env:SOURCE_REVISION $env:SOURCE_TREE | Out-Null
+          $workflowTree = Check-Checkout $handoff $env:GITHUB_SHA $null
+          $workflowRelative = '.github/workflows/windows-924-build.yml'
+          $diff = Git-Text $handoff @('diff', '--name-status', $env:SOURCE_REVISION, 'HEAD', '--')
+          if ($diff -cne "A`t$workflowRelative") { throw 'Only the new workflow may differ from source' }
+          $workflowFile = Join-Path $handoff $workflowRelative
+          if ([IO.File]::ReadAllBytes($workflowFile) -contains 13) { throw 'Workflow must use LF bytes' }
+          $workflowHash = Hash $workflowFile
+          if (-not (Select-String -LiteralPath (Join-Path $source 'Cargo.toml') -Pattern '^version = "0\.25\.1-dev"$')) { throw 'Package version differs' }
+          if (-not (Select-String -LiteralPath (Join-Path $source 'src/state/schema.rs') -SimpleMatch 'pub(crate) const SCHEMA_VERSION: i32 = 35;')) { throw 'Schema differs' }
+          $root = Join-Path $env:RUNNER_TEMP "kei-924-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          if (Test-Path -LiteralPath $root) { throw 'Build directory already exists' }
+          $out = Join-Path $root 'evidence'
+          $package = Join-Path $root 'package'
+          $extracted = Join-Path $root 'extracted'
+          New-Item -ItemType Directory -Path $root, $out, $package, $extracted | Out-Null
+          $env:CARGO_TARGET_DIR = Join-Path $root 'target'
+          & rustup toolchain install 1.94.1 --profile minimal --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'Toolchain installation failed' }
+          $rustc = (& rustc --version --verbose | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $rustc -notmatch '(?m)^release: 1\.94\.1\r?$') { throw 'Rust toolchain differs' }
+          $cargo = (& cargo --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $cargo -notmatch '^cargo 1\.94\.1 ') { throw 'Cargo toolchain differs' }
+          & cargo build --locked --release --target x86_64-pc-windows-msvc --bin kei
+          if ($LASTEXITCODE -ne 0) { throw 'Release build failed' }
+          $exe = Join-Path $env:CARGO_TARGET_DIR 'x86_64-pc-windows-msvc/release/kei.exe'
+          $bytes = [IO.File]::ReadAllBytes($exe)
+          if ($bytes.Length -lt 64 -or $bytes[0] -ne 0x4d -or $bytes[1] -ne 0x5a) { throw 'Missing MZ header' }
+          $offset = [BitConverter]::ToInt32($bytes, 0x3c)
+          if ($offset -lt 64 -or $offset -gt ($bytes.Length - 24)) { throw 'PE header is out of bounds' }
+          if ([BitConverter]::ToUInt32($bytes, $offset) -ne 0x00004550 -or
+              [BitConverter]::ToUInt16($bytes, $offset + 4) -ne 0x8664) { throw 'Expected AMD64 PE signature' }
+          $version = Smoke $exe @('--version') (Join-Path $out 'built-version.txt')
+          if ($version -cne 'kei 0.25.1-dev') { throw 'Built version differs' }
+          Smoke $exe @('--help') (Join-Path $out 'help.txt') | Out-Null
+          Smoke $exe @('sync', '--help') (Join-Path $out 'sync-help.txt') | Out-Null
+          $exeHash = Hash $exe
+          Copy-Item -LiteralPath $exe -Destination (Join-Path $package 'kei.exe')
+          $runUrl = "https://github.com/rhoopr/kei/actions/runs/$env:GITHUB_RUN_ID"
+          $artifactName = "kei-windows-x86_64-test-30fe9ec-$env:GITHUB_RUN_ID"
+          $zipName = 'kei-windows-x86_64-test-30fe9ec.zip'
+          $readme = Join-Path $package 'TEST-BUILD.txt'
+          @"
+          kei 0.25.1-dev Windows AMD64 TEST BUILD, not a release. State schema 35.
+          Source: $env:SOURCE_REVISION
+          Workflow commit: $env:GITHUB_SHA
+          Run/download: $runUrl (artifact: $artifactName; retained 14 days).
+          Download the artifact, unpack its outer archive, then unpack $zipName.
+          Check the inner ZIP SHA-256 against SHA256SUMS.txt and the executable
+          SHA-256 against provenance.json. Actual expiry is shown by GitHub.
+          Qualification covers version/help and packaging only, not reproduction
+          or native filesystem behavior. Leave your current healthy setup unchanged.
+          Matched pre-reset DB/WAL, config, media and auth backups are NOT confirmed.
+          A historical database alone is insufficient. Keep credentials/backups local;
+          never upload credentials. Do not sync, migrate or reset until prerequisites
+          are reviewed: matched quiescent backups, untouched originals, independent
+          ordinary copies and reviewed effective config/environment/persisted paths.
+          Any schema 34 to 35 upgrade belongs only on disposable copies; no downgrade,
+          SQL path patches, production reuse or security-warning bypass.
+          "@ | Set-Content -LiteralPath $readme -Encoding utf8
+          $readmeHash = Hash $readme
+          $zip = Join-Path $out $zipName
+          Compress-Archive -LiteralPath @((Join-Path $package 'kei.exe'), $readme) -DestinationPath $zip
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [IO.Compression.ZipFile]::OpenRead($zip)
+          try {
+            $names = @($archive.Entries | ForEach-Object { $_.FullName })
+            if ($names.Count -ne 2 -or (@($names | Sort-Object -Unique)).Count -ne 2) { throw 'Archive entry count differs' }
+            foreach ($entry in $archive.Entries) {
+              if (@('kei.exe', 'TEST-BUILD.txt') -cnotcontains $entry.FullName -or $entry.Length -le 0) { throw 'Unexpected archive entry' }
+            }
+          } finally { $archive.Dispose() }
+          Expand-Archive -LiteralPath $zip -DestinationPath $extracted
+          $files = @(Get-ChildItem -LiteralPath $extracted -Force)
+          if ($files.Count -ne 2 -or @($files | Where-Object { $_.PSIsContainer }).Count -ne 0) { throw 'Extraction layout differs' }
+          $extractedExe = Join-Path $extracted 'kei.exe'
+          if ((Hash $extractedExe) -cne $exeHash -or (Hash (Join-Path $extracted 'TEST-BUILD.txt')) -cne $readmeHash) { throw 'Extraction hashes differ' }
+          if ((Smoke $extractedExe @('--version') (Join-Path $out 'extracted-version.txt')) -cne 'kei 0.25.1-dev') { throw 'Extracted version differs' }
+          $zipHash = Hash $zip
+          Check-Checkout $source $env:SOURCE_REVISION $env:SOURCE_TREE | Out-Null
+          Check-Checkout $handoff $env:GITHUB_SHA $workflowTree | Out-Null
+          if ((Hash $workflowFile) -cne $workflowHash -or (Hash $exe) -cne $exeHash) { throw 'Candidate bytes changed' }
+          "$zipHash  $zipName" | Set-Content -LiteralPath (Join-Path $out 'SHA256SUMS.txt') -Encoding ascii
+          [ordered]@{
+            repository = 'rhoopr/kei'; source_commit = $env:SOURCE_REVISION; source_tree = $env:SOURCE_TREE
+            source_ci = 'https://github.com/rhoopr/kei/actions/runs/38143814819'; version = $version; schema = 35
+            workflow_commit = $env:GITHUB_SHA; workflow_tree = $workflowTree; workflow_file = $workflowRelative
+            workflow_sha256 = $workflowHash; workflow_ref = $env:GITHUB_WORKFLOW_REF
+            run_url = $runUrl; run_id = $env:GITHUB_RUN_ID; run_attempt = $env:GITHUB_RUN_ATTEMPT
+            artifact = $artifactName; retention_days = 14; expiry = 'See GitHub artifact expiry; download before expiry'
+            runner = [ordered]@{ os = $env:RUNNER_OS; arch = $env:RUNNER_ARCH; name = $env:RUNNER_NAME; image = $env:ImageOS; image_version = $env:ImageVersion }
+            powershell = $PSVersionTable.PSVersion.ToString(); toolchain = '1.94.1'; rustc = $rustc; cargo = $cargo
+            target = 'x86_64-pc-windows-msvc'; jobs = 2; features = 'default'
+            build_command = 'cargo build --locked --release --target x86_64-pc-windows-msvc --bin kei'
+            executable = 'kei.exe'; exe_sha256 = $exeHash; archive = $zipName; archive_sha256 = $zipHash
+            readme = 'TEST-BUILD.txt'; readme_sha256 = $readmeHash; pe_machine = 'AMD64 (0x8664)'
+            checks = @('source/workflow identity and clean states before/after', 'MZ/bounded PE/AMD64',
+              'built --version', 'built --help', 'built sync --help', 'exact flat ZIP entries',
+              'extraction hashes', 'extracted --version')
+            logs = @('built-version.txt', 'help.txt', 'sync-help.txt', 'extracted-version.txt')
+            log_streams = 'combined stdout/stderr; all native exit codes required zero'
+            pending = @('reporter reproduction', 'native filesystem qualification', 'matched historical backups and manual path review')
+            helpers = 'none shipped or executed'; credential_uploads = 'none'
+          } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $out 'provenance.json') -Encoding utf8
+          $allowed = @($zipName, 'SHA256SUMS.txt', 'provenance.json', 'built-version.txt', 'help.txt', 'sync-help.txt', 'extracted-version.txt')
+          $publicFiles = @(Get-ChildItem -LiteralPath $out -Force -Recurse)
+          if ($publicFiles.Count -ne $allowed.Count) { throw 'Evidence file count differs' }
+          foreach ($file in $publicFiles) {
+            if ($file.PSIsContainer -or $file.DirectoryName -cne $out -or $allowed -cnotcontains $file.Name) { throw 'Unexpected upload content' }
+          }
+          "Test build only. Source: $env:SOURCE_REVISION; workflow: $env:GITHUB_SHA. Binary SHA-256: $exeHash; ZIP SHA-256: $zipHash. Download $artifactName at $runUrl within 14 days. No sync requested." |
+            Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - name: Upload only the verified test package and public evidence
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kei-windows-x86_64-test-30fe9ec-${{ github.run_id }}
+          path: ${{ runner.temp }}/kei-924-${{ github.run_id }}-${{ github.run_attempt }}/evidence/
+          if-no-files-found: error
+          retention-days: 14
