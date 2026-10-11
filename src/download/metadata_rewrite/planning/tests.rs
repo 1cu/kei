@@ -158,6 +158,7 @@ fn plan_metadata_write_withholds_offset_from_an_unverified_timestamp() {
             #[cfg(feature = "xmp")]
             native_heif_capture_time: crate::download::metadata::HeifNativeCaptureTime::Present {
                 datetime_original: Some(existing.clone()),
+                subseconds_original: Some("629".into()),
                 offset_time_original: Some("+11:00".into()),
             },
             ..crate::download::metadata::ExifProbe::default()
@@ -198,6 +199,7 @@ fn capture_timestamp_repair_requires_an_offset_and_replaces_the_pair() {
         &probe,
     );
     assert_eq!(write.datetime.as_deref(), Some("2024:06:15 10:00:00"));
+    assert_eq!(write.datetime_subseconds.as_deref(), Some("629"));
     assert_eq!(write.offset_time_original.as_deref(), Some("+11:00"));
     assert!(write.clear_datetime_offsets);
 
@@ -257,6 +259,7 @@ fn plan_metadata_write_accepts_iso_timestamps_from_the_xmp_probe() {
             #[cfg(feature = "xmp")]
             native_heif_capture_time: crate::download::metadata::HeifNativeCaptureTime::Present {
                 datetime_original: Some(existing.clone()),
+                subseconds_original: Some("629".into()),
                 offset_time_original: Some("+11:00".into()),
             },
             ..crate::download::metadata::ExifProbe::default()
