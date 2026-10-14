@@ -209,20 +209,19 @@ async fn download_photos_incremental_with_smart_folder_refresh(
     let (incremental_passes, smart_folder_passes) =
         split_incremental_and_smart_folder_passes(passes);
 
-    if incremental_passes.is_empty() {
-        return download_photos_full_with_token(
-            download_client,
-            &smart_folder_passes,
-            config,
-            controls,
-            shutdown_token,
-        )
-        .await;
-    }
+    // Smart queries establish selection, not source replay. With no album or
+    // unfiled pass, use the smart pass only to access its zone change stream.
+    // Incremental routing has no destinations for SmartFolder passes, so media
+    // admission remains owned by the selected query below.
+    let delta_passes = if incremental_passes.is_empty() {
+        &smart_folder_passes
+    } else {
+        &incremental_passes
+    };
 
     let mut incremental_result = download_photos_incremental(
         download_client,
-        &incremental_passes,
+        delta_passes,
         config,
         zone_sync_token,
         controls,
@@ -247,7 +246,7 @@ async fn download_photos_incremental_with_smart_folder_refresh(
         &smart_folder_config,
         controls,
         shutdown_token,
-        false,
+        incremental_passes.is_empty(),
     )
     .await?;
 
@@ -255,14 +254,28 @@ async fn download_photos_incremental_with_smart_folder_refresh(
         !matches!(smart_folder_result.outcome, DownloadOutcome::Success)
             || smart_folder_result.checkpoint.interrupted
             || smart_folder_result.checkpoint.enumeration_errors > 0;
-    if !smart_folder_refresh_failed {
-        // The token that matters for this mixed incremental cycle is the
-        // `/changes/zone` token captured below. A selected smart-folder
-        // records/query refresh can complete cleanly while still lacking a
-        // full-enumeration query token, especially under bounded modes. Keep
-        // refresh failures conservative, but do not let query-token telemetry
-        // veto the safe incremental zone checkpoint.
+    if !incremental_passes.is_empty() && !smart_folder_refresh_failed {
+        // A mixed cycle's smart query is a subset refresh; the independently
+        // selected incremental passes own its zone checkpoint. A sole-smart
+        // query establishes all selection evidence and must retain its token
+        // hold, even when the source replay has a usable successor.
         smart_folder_result.clear_full_query_token_block();
+    }
+
+    if incremental_passes.is_empty() {
+        // This query owns the whole selection, its bounded local path proof,
+        // and comparable inventory. Source replay may veto that evidence, but
+        // its token is the only candidate for the source checkpoint.
+        smart_folder_result.outcome =
+            merge_download_outcomes(&incremental_result.outcome, &smart_folder_result.outcome);
+        smart_folder_result.accumulate(&incremental_result);
+        if smart_folder_refresh_failed {
+            smart_folder_result.block_incremental_token(SMART_FOLDER_REFRESH_FAILED_REASON);
+        }
+        smart_folder_result.sync_token = (!smart_folder_result.checkpoint.sync_token_blocked)
+            .then_some(incremental_result.sync_token)
+            .flatten();
+        return Ok(smart_folder_result);
     }
 
     incremental_result.outcome =

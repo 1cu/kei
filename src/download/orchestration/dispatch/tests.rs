@@ -730,3 +730,87 @@ async fn retained_token_fallback_distinguishes_expiry_from_missing_successor() {
         assert_eq!(result.sync_token.as_deref(), Some("healthy-query-eof"));
     }
 }
+
+#[tokio::test]
+async fn smart_only_delta_replays_source_without_admitting_unselected_media() {
+    let server = crate::start_wiremock_or_skip!();
+    let mut records = incremental_photo_records("OUTSIDE_SMART");
+    records[0]["fields"]["resOriginalRes"]["value"]["downloadURL"] =
+        json!(format!("{}/unselected.jpg", server.uri()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let session = super::super::test_support::changes_zone_session_with_query_page(
+        Arc::clone(&calls),
+        records,
+        json!({"records":[],"syncToken":"selected-query-token"}),
+        0,
+    );
+    let passes = vec![AlbumPass {
+        kind: PassKind::SmartFolder,
+        album: changes_album("Hidden", session.clone()),
+        exclude_ids: Arc::new(FxHashSet::default()),
+    }];
+    let dir = TempDir::new().unwrap();
+    let config = Arc::new(incremental_test_config(&dir));
+    let expected_scope = crate::download::inventory_scope(&passes, &config);
+    let result = download_photos_with_sync(
+        &Client::new(),
+        &passes,
+        config,
+        DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(session.records_query_count() > 0);
+    assert!(result.checkpoint.completed_delta_replay);
+    assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+    assert_eq!(
+        result.stats.downloaded, 0,
+        "delta-only child has no selected query destination"
+    );
+    assert_eq!(result.stats.failed, 0);
+    assert_eq!(result.stats.bytes_downloaded, 0);
+    let inventory = result.inventory.as_ref().unwrap();
+    assert_eq!(inventory.scope, expected_scope);
+    assert_eq!(inventory.total, 0);
+    assert_eq!(inventory.assets_seen, 0);
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn smart_only_delta_successor_retains_missing_query_token_hold() {
+    for query_page in [
+        json!({"records": []}),
+        json!({"records": [], "syncToken": ""}),
+    ] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let session = super::super::test_support::changes_zone_session_with_query_page(
+            Arc::clone(&calls),
+            vec![],
+            query_page,
+            0,
+        );
+        let passes = vec![AlbumPass {
+            kind: PassKind::SmartFolder,
+            album: changes_album("Hidden", session.clone()),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let dir = TempDir::new().unwrap();
+        let result = download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(incremental_test_config(&dir)),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(session.records_query_count() > 0);
+        assert!(result.checkpoint.completed_delta_replay);
+        assert!(result.checkpoint.sync_token_blocked);
+        assert!(result.sync_token.is_none());
+        assert_eq!(result.stats.downloaded, 0);
+    }
+}
