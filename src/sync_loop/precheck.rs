@@ -334,6 +334,18 @@ pub(super) async fn check_changes_database(
     if library_states.is_empty() {
         return WatchPrecheck::SkipAll;
     }
+    for library in library_states {
+        if !library.library.last_indexing_finished()
+            || db
+                .get_metadata(&crate::sync_cycle::indexing_reconciliation_key(
+                    &library.zone_name,
+                ))
+                .await
+                .map_or(true, |hold| hold.is_some())
+        {
+            return WatchPrecheck::proceed_all();
+        }
+    }
     let scoped_token = match db
         .get_scoped_db_sync_token(
             &scope.provider,

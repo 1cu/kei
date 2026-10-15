@@ -434,6 +434,7 @@ async fn shutdown_cancellation_exits_download_pass_promptly() {
         selection_run: None,
         selection_pass: None,
         retry_only: false,
+        provisional: false,
         max_download_attempts: 10,
         sync_mode: SyncMode::Full,
         enum_config_hash: None,

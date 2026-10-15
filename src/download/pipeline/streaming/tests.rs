@@ -74,6 +74,7 @@ async fn test_producer_panic_propagates_as_error() {
         selection_run: None,
         selection_pass: None,
         retry_only: false,
+        provisional: false,
         max_download_attempts: 10,
         sync_mode: SyncMode::Full,
         enum_config_hash: None,

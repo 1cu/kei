@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.25.2] - 2026-10-15
+
+### Fixed
+
+- Downloads can progress when iCloud Photos reports `RUNNING` indexing. These runs remain provisional: kei preserves trusted sync tokens, retains a per-library reconciliation requirement across restarts, and suppresses deletion and membership decisions from provisional listings. After `FINISHED`, a complete inventory and retained-token replay must pass the checkpoint gates before incremental sync resumes. Existing verified downloads are reused. ([#951](https://github.com/rhoopr/kei/issues/951#issuecomment-6173266761))
+
+### Known limitations
+
+- Managed `photos.edited_naming = "primary"` layouts continue to wait for `FINISHED` because provisional inventory cannot certify replacement coverage. Missing or unknown indexing responses still fail closed. Bounded, interrupted, failed, or uncommitted reconciliation keeps the hold. See [v0.25.2 upgrade guidance](docs/v0.25.2-upgrade.md).
+
 ## [0.25.1] - 2026-10-13
 
 ### Added

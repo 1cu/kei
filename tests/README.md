@@ -722,6 +722,16 @@ An owned private selection with real retained deferred debt also keeps the path
 transition pending after a successful bounded query and file-backed reopen.
 Ordinary bounded refresh queries remain part of the unchanged cycle.
 
+The `sync_loop::runner::tests::indexing` tests use file-backed SQLite reopened
+between cycles, pre-existing downloaded media, real local HTTP downloads, and
+production readiness requests. They cover RUNNING inventory that omits an
+existing file and a previously unseen asset, repeated provisional restarts,
+FINISHED recovery with an empty change feed, verified file reuse, and a steady
+incremental cycle. Failure cases retain the trusted cursor and durable hold after
+malformed inventory, interruption, checkpoint-write failure, readiness regression,
+and unknown readiness. A seeded complete album snapshot and pending row prove
+that provisional absence does not retire membership, retry state, or media.
+
 ## Running
 
 Choose the route by purpose:
@@ -1338,11 +1348,11 @@ Shared Library ownership.
 Primary discovery availability is covered by
 `primary_discovery_default_selection_does_not_initialize_unselected_private_libraries`:
 default selection and the selected library album query succeed with explicit
-primary ownership while an unrelated private zone is still indexing. The query
+primary ownership while an unrelated private zone reports unknown readiness. The query
 returns a synthetic named user album from the exact selected scope. A full-map
 request fails without publishing a
 partial map. The qualified primary survives that failure, and a later full-map
-request recovers when indexing finishes. The selected-primary indexing failure
+request recovers when readiness becomes known. The selected-primary indexing failure
 test separately proves that cached valid descriptors cannot publish ownership
 before the selected scope passes its own check. Malformed-list tests prove that
 invalid complete-list evidence is never cached. Existing queue admission tests

@@ -135,7 +135,7 @@ impl PhotosService {
 
     /// Create a new `PhotosService`.
     ///
-    /// This checks that the primary library has finished indexing.
+    /// This checks primary readiness, retaining RUNNING as provisional.
     pub async fn new(
         service_root: String,
         session: Box<dyn PhotosSession>,
@@ -852,7 +852,7 @@ mod tests {
                 && self.blocked_zone.lock().unwrap().as_deref()
                     == request["zoneID"]["zoneName"].as_str()
             {
-                return Ok(json!({"records":[{"fields":{"state":{"value":"RUNNING"}}}]}));
+                return Ok(json!({"records":[{"fields":{"state":{"value":"UNKNOWN"}}}]}));
             }
             self.discovery.post(url, body, headers).await
         }
@@ -926,7 +926,11 @@ mod tests {
         assert_eq!(session.discovery.listings.lock().unwrap().len(), 1);
         // Full discovery still initializes its requested complete library map.
         let error = service.all_libraries().await.unwrap_err();
-        assert!(error.to_string().contains("RUNNING"));
+        assert!(
+            error
+                .to_string()
+                .contains("unknown photo library indexing state")
+        );
         assert!(
             service.private_libraries.is_none(),
             "failed full initialization must not publish a partial library map"
@@ -976,7 +980,7 @@ mod tests {
                 .await
                 .unwrap_err()
                 .to_string()
-                .contains("RUNNING")
+                .contains("unknown photo library indexing state")
         );
         assert!(!service.primary_library.is_private_default_owner());
         assert!(service.private_zones.is_some());
@@ -1136,12 +1140,12 @@ mod tests {
         }
     }
 
-    struct RunningIndexSession {
+    struct UnknownIndexSession {
         zone_response: Value,
     }
 
     #[async_trait::async_trait]
-    impl session::PhotosSession for RunningIndexSession {
+    impl session::PhotosSession for UnknownIndexSession {
         async fn post(
             &self,
             _url: &str,
@@ -1151,7 +1155,7 @@ mod tests {
             if body.contains("CheckIndexingState") {
                 return Ok(json!({
                     "records": [{
-                        "fields": {"state": {"value": "RUNNING"}}
+                        "fields": {"state": {"value": "UNKNOWN"}}
                     }]
                 }));
             }
@@ -1159,7 +1163,7 @@ mod tests {
         }
 
         fn clone_box(&self) -> Box<dyn session::PhotosSession> {
-            Box::new(RunningIndexSession {
+            Box::new(UnknownIndexSession {
                 zone_response: self.zone_response.clone(),
             })
         }
@@ -1267,7 +1271,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_libraries_fails_on_non_deleted_zone_initialization_failure() {
-        let session = RunningIndexSession {
+        let session = UnknownIndexSession {
             zone_response: json!({
                 "zones": [
                     {"zoneID": {"zoneName": "PrimarySync"}, "syncToken": "tok"},
@@ -1287,7 +1291,7 @@ mod tests {
         let err = svc.fetch_private_libraries().await.unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("PrimarySync") && msg.contains("RUNNING"),
+            msg.contains("PrimarySync") && msg.contains("unknown photo library indexing state"),
             "regular non-deleted zone failure must fail discovery: {msg}"
         );
         assert!(

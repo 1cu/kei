@@ -57,6 +57,76 @@ pub(crate) const SYNC_TOKEN_PREFIX: &str = "sync_token:";
 // Legacy inventory_anchor: rows lack coverage proof and are never read or migrated.
 const INVENTORY_ANCHOR_PREFIX: &str = "inventory_anchor_v1:";
 const INVENTORY_ANCHOR_VERSION: u8 = 1;
+/// Presence is a durable obligation, including unknown future payloads. Only a
+/// proven FINISHED full inventory may remove it with checkpoint promotion.
+pub(crate) const INDEXING_RECONCILIATION_PREFIX: &str = "indexing_reconciliation_required:";
+
+pub(crate) fn indexing_reconciliation_key(zone: &str) -> String {
+    format!("{INDEXING_RECONCILIATION_PREFIX}{zone}")
+}
+
+/// Observe readiness and durably retain every RUNNING observation, even if a
+/// later readiness request fails before enumeration starts.
+pub(crate) async fn prepare_indexing_reconciliation(
+    library: &crate::icloud::photos::PhotoLibrary,
+    db: Option<&dyn download::DownloadStore>,
+    dry_run: bool,
+) -> anyhow::Result<(bool, Option<String>)> {
+    let key = indexing_reconciliation_key(library.zone_name());
+    let mut hold = match db {
+        Some(db) => db.get_metadata(&key).await?,
+        None => None,
+    };
+    if !library.last_indexing_finished() && !dry_run {
+        let db = db.ok_or_else(|| {
+            anyhow::anyhow!("Provisional indexing downloads require durable state")
+        })?;
+        if hold.is_none() {
+            db.set_metadata(&key, "1").await?;
+            hold = Some("1".to_owned());
+        }
+    }
+    let finished = library.check_indexing().await?;
+    if !finished && !dry_run {
+        let db = db.ok_or_else(|| {
+            anyhow::anyhow!("Provisional indexing downloads require durable state")
+        })?;
+        if hold.is_none() {
+            db.set_metadata(&key, "1").await?;
+            hold = Some("1".to_owned());
+        }
+    }
+    Ok((finished, hold))
+}
+
+/// Cross-zone album hydration contributes to the selected listing too. Any
+/// unfinished source makes the selected zone provisional until all are ready.
+pub(crate) async fn prepare_library_indexing(
+    library: &LibraryState,
+    db: Option<&dyn download::DownloadStore>,
+    dry_run: bool,
+) -> anyhow::Result<(bool, Option<String>)> {
+    let (mut finished, mut hold) =
+        prepare_indexing_reconciliation(&library.library, db, dry_run).await?;
+    for source in &library.cross_zone_libraries {
+        if source.zone_name() == library.zone_name {
+            continue;
+        }
+        let source_was_running = !source.last_indexing_finished();
+        let (source_finished, _) = prepare_indexing_reconciliation(source, db, dry_run).await?;
+        finished &= source_finished;
+        if (source_was_running || !source_finished) && hold.is_none() && !dry_run {
+            let db = db.ok_or_else(|| {
+                anyhow::anyhow!("Provisional indexing downloads require durable state")
+            })?;
+            db.set_metadata(&indexing_reconciliation_key(&library.zone_name), "1")
+                .await?;
+            hold = Some("1".to_owned());
+        }
+    }
+    Ok((finished, hold))
+}
+
 pub(crate) const RETAINED_CHECKPOINT_HOLD_PREFIX: &str = "retained_checkpoint_hold:";
 const RETAINED_CHECKPOINT_RETRY_SECONDS: i64 = 60 * 60;
 const RETAINED_CHECKPOINT_MAX_ATTEMPTS: u8 = 3;
@@ -1009,15 +1079,26 @@ pub(crate) async fn run_cycle(
     };
     let mut active_cursor_fences = Vec::new();
 
-    for lib_state in library_states
-        .iter()
-        .copied()
-        .filter(|state| has_active_passes(state))
-    {
+    for lib_state in library_states.iter().copied() {
         if shutdown_token.is_cancelled() {
             break;
         }
 
+        let indexing_key = indexing_reconciliation_key(&lib_state.zone_name);
+        let (indexing_finished, indexing_hold_at_start) =
+            prepare_library_indexing(lib_state, state_db, config.runtime.dry_run).await?;
+        let indexing_reconciliation = indexing_hold_at_start.is_some() || !indexing_finished;
+        if !has_active_passes(lib_state) {
+            db_sync_token_advance_safe &= !indexing_reconciliation;
+            continue;
+        }
+        if !indexing_finished {
+            db_sync_token_advance_safe = false;
+            path_reconciliation_complete = false;
+            tracing::warn!(
+                "Photo library indexing is RUNNING; downloads are provisional, deletions and checkpoint promotion are disabled"
+            );
+        }
         let retained_cursor_at_start = if let Some(db) = state_db {
             db.get_metadata(&lib_state.sync_token_key).await?
         } else {
@@ -1031,6 +1112,8 @@ pub(crate) async fn run_cycle(
             None
         };
         let mut zone_metadata_fence = enum_metadata_at_start.clone();
+        zone_metadata_fence.push((indexing_key.clone(), indexing_hold_at_start.clone()));
+        active_cursor_fences.push((indexing_key.clone(), indexing_hold_at_start.clone()));
         zone_metadata_fence.push((
             lib_state.sync_token_key.clone(),
             retained_cursor_at_start.clone(),
@@ -1135,7 +1218,8 @@ pub(crate) async fn run_cycle(
         }
 
         let mut legacy_cycle = download::legacy_preservation::LegacyCycle::default();
-        if download_controls.run_mode.downloads_files()
+        if indexing_finished
+            && download_controls.run_mode.downloads_files()
             && !lib_state.plan_is_stale
             && let Some(db) = state_db
             && db
@@ -1182,7 +1266,12 @@ pub(crate) async fn run_cycle(
             } else {
                 None
             };
-        let sync_mode_decision = if let Some(refresh_decision) =
+        let sync_mode_decision = if indexing_reconciliation {
+            SyncModeDecision {
+                mode: download::SyncMode::Full,
+                full_enumeration_reason: Some(download::FullEnumerationReason::OtherStaticReason),
+            }
+        } else if let Some(refresh_decision) =
             metadata_refresh_mode_decision(config.runtime.refresh_metadata)
         {
             refresh_decision
@@ -1274,12 +1363,16 @@ pub(crate) async fn run_cycle(
             Arc::clone(&asset_groupings),
             Arc::from(lib_state.zone_name.as_str()),
         );
+        Arc::make_mut(&mut download_config).provisional = !indexing_finished;
         if pending_download_config_hash.is_some() && path_reconciliation_has_smart_folders {
             Arc::make_mut(&mut download_config).complete_path_selection = true;
         }
         let download_client = shared_session.read().await.download_client().clone();
         let mut path_reconciliation_requires_smart_query = false;
-        if pending_download_config_hash.is_some() && download_controls.run_mode.downloads_files() {
+        if indexing_finished
+            && pending_download_config_hash.is_some()
+            && download_controls.run_mode.downloads_files()
+        {
             let reconciliation = download::reconcile_catalog_paths_with_client(
                 &download_client,
                 &lib_state.plan.passes,
@@ -1330,7 +1423,8 @@ pub(crate) async fn run_cycle(
             lib_state.plan.passes.len(),
         );
 
-        if legacy_cycle.requires_inventory()
+        if indexing_finished
+            && legacy_cycle.requires_inventory()
             && sync_result.full_enumeration_ran
             && matches!(
                 source_checkpoint_decision(
@@ -1384,7 +1478,9 @@ pub(crate) async fn run_cycle(
         };
         if (matches!(enum_config_hash_outcome, EnumConfigHashOutcome::Changed)
             || unresolved_identity
-            || legacy_cycle.requires_inventory())
+            || legacy_cycle.requires_inventory()
+            || indexing_reconciliation)
+            && indexing_finished
             && sync_result.full_enumeration_ran
             && !sync_result.checkpoint.completed_delta_replay
             && checkpoint_transition_state_safe
@@ -1561,7 +1657,8 @@ pub(crate) async fn run_cycle(
                  access and filters if this was unexpected"
             );
         }
-        if library_completed_without_errors
+        if indexing_finished
+            && library_completed_without_errors
             && !sync_result.checkpoint.enumeration_incomplete
             && sync_result.checkpoint.state_write_failures == 0
             && !cycle_has_stale_plan
@@ -1578,6 +1675,52 @@ pub(crate) async fn run_cycle(
                 &mut sync_result.stats,
             )
             .await;
+        }
+
+        // Readiness can regress during a long inventory. Recheck at the
+        // checkpoint boundary; even a failed probe leaves durable retry debt.
+        let readiness_after = tokio::select! {
+            biased;
+            () = shutdown_token.cancelled() => None,
+            result = async {
+                let mut finished = lib_state.library.check_indexing().await?;
+                for source in &lib_state.cross_zone_libraries {
+                    if source.zone_name() != lib_state.zone_name {
+                        finished &= source.check_indexing().await?;
+                    }
+                }
+                Ok::<_, crate::icloud::error::ICloudError>(finished)
+            } => Some(result),
+        };
+        let indexing_safe = indexing_finished && matches!(readiness_after, Some(Ok(true)));
+        if !indexing_safe {
+            if !config.runtime.dry_run
+                && let Some(db) = state_db
+            {
+                db.set_metadata(&indexing_key, "1").await?;
+                // This cycle must not stage or activate a token, even if all
+                // selected records happened to carry one unanimous candidate.
+            }
+            sync_result.checkpoint.sync_token_blocked = true;
+            sync_result.checkpoint.project(&mut sync_result.stats);
+            sync_result.stats.sync_token_blocked_reason = Some("indexing_reconciliation_required");
+            sync_result.stats.sync_token_blocked_source = Some("icloud");
+            sync_result.stats.sync_token_blocked_explanation = Some(
+                "indexing results are provisional; a FINISHED full reconciliation is required",
+            );
+            db_sync_token_advance_safe = false;
+            path_reconciliation_complete = false;
+        }
+        // A failed or bounded reconciliation cannot clear the hold merely
+        // because its successfully planned transfers have durable retry rows.
+        if indexing_reconciliation
+            && (!sync_result.full_enumeration_ran
+                || !library_completed_without_errors
+                || sync_result.stats.failed > 0
+                || sync_result.stats.exif_failures > 0)
+        {
+            sync_result.checkpoint.sync_token_blocked = true;
+            sync_result.checkpoint.project(&mut sync_result.stats);
         }
 
         // Provider cursor safety is independent from transfer completion.
@@ -1745,6 +1888,7 @@ pub(crate) async fn run_cycle(
                                 metadata_deletes: vec![
                                     state::unresolved_identity_key(&lib_state.zone_name),
                                     retained_checkpoint_hold_key(&lib_state.zone_name),
+                                    indexing_key.clone(),
                                 ],
                             })
                             .await
@@ -1955,6 +2099,7 @@ pub(crate) async fn run_cycle(
                 metadata_updates.push((lib_state.sync_token_key.clone(), token));
                 metadata_deletes.push(candidate_key);
                 metadata_deletes.push(state::unresolved_identity_key(&lib_state.zone_name));
+                metadata_deletes.push(indexing_reconciliation_key(&lib_state.zone_name));
             }
             if db_sync_token_advance_safe {
                 metadata_updates.push((ENUM_CONFIG_HASH_KEY.to_owned(), enum_config_hash));

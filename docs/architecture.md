@@ -606,6 +606,31 @@ sync_loop::run_sync
   -> cycle reporting and watch control
 ```
 
+Photo readiness is explicit provider evidence. `PhotoLibrary` accepts `FINISHED`
+or `RUNNING`; missing and unknown states fail closed. Sync checks readiness before
+watch shortcuts and again at the checkpoint boundary. Before downloading from
+`RUNNING`, the cycle persists `indexing_reconciliation_required:<zone>` in the
+existing metadata table. Presence is the obligation, including unknown future
+payloads; no schema migration is needed. The previous trusted zone and database
+checkpoints remain unchanged. Cross-zone album sources also contribute readiness.
+
+While indexing, the download dispatcher uses full queries without incremental
+replay, retained-work admission, metadata repair, retry retirement, or album
+snapshot completion. Ordinary media still uses the existing verified publication
+and durable finalization path. Managed primary layouts wait for `FINISHED`.
+Watch cycles with a hold bypass the database no-change shortcut and rebuild
+collection and album plans so omitted albums can reappear after indexing.
+
+A retained hold forces full reconciliation after `FINISHED`. A prior trusted
+cursor is replayed after the complete inventory to bridge concurrent changes;
+its rejection retains the existing checkpoint-evidence hold. Bounded coverage,
+interruption, transfer/metadata failure, stale plans, missing proof, state-write
+failure, or readiness regression cannot clear the indexing obligation. Hold
+removal and trusted token promotion share a fenced checkpoint transaction,
+including aggregate config-drift promotion. Provisional inventory cannot replace
+a comparable inventory anchor. Readiness probes are observations, not an atomic
+snapshot guarantee from Apple.
+
 Inventory-drop diagnostics use a complete count measurement from the initial
 full-query invocation, captured before activity and delta-bridge composition.
 The download owner records natural completion, usable counts, and canonical

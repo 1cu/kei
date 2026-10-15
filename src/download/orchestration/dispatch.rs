@@ -305,6 +305,28 @@ async fn download_photos_with_sync_inner(
     controls: DownloadControls,
     shutdown_token: CancellationToken,
 ) -> Result<SyncResult> {
+    if config.provisional {
+        // Do not turn incomplete listings/lookups into deletion, membership,
+        // generation activation, retry retirement, or incremental evidence.
+        // Managed replacement needs independently certified current coverage.
+        anyhow::ensure!(
+            config.edited_naming != crate::types::EditedNaming::Primary
+                && match &config.state_db {
+                    Some(db) => !db.has_primary_layouts(&config.library).await?,
+                    None => true,
+                },
+            "Provisional indexing downloads must wait for FINISHED when managed primary layouts are enabled"
+        );
+        return download_photos_full_with_token_policy(
+            download_client,
+            passes,
+            &config,
+            controls,
+            shutdown_token,
+            false,
+        )
+        .await;
+    }
     let primary_layout_requested = config.edited_naming == crate::types::EditedNaming::Primary
         || match &config.state_db {
             Some(db) => db.has_primary_layouts(&config.library).await?,
