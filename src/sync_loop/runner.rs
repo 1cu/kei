@@ -610,23 +610,17 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         // Readiness may change without changes/database events. Persist holds
         // before any shortcut and rebuild collection/pass scope while held so
         // a provisional album list cannot certify FINISHED reconciliation.
-        let mut indexing_hold = false;
-        for library in &library_states {
-            let (_, hold) = crate::sync_cycle::prepare_library_indexing(
-                library,
-                state_db
-                    .as_deref()
-                    .map(|db| db as &dyn download::DownloadStore),
-                config.runtime.dry_run,
-            )
-            .await?;
-            indexing_hold |= hold.is_some();
-        }
-        if indexing_hold {
-            (library_states, collection_context) =
-                super::planning::resolve_library_plans(&mut photos_service, &libraries, &config)
-                    .await?;
-        }
+        super::planning::refresh_indexing_library_plans(
+            &mut photos_service,
+            &libraries,
+            &config,
+            state_db
+                .as_deref()
+                .map(|db| db as &dyn download::DownloadStore),
+            &mut library_states,
+            &mut collection_context,
+        )
+        .await?;
 
         // In watch mode with incremental sync, use changes/database as a
         // cheap pre-check before refreshing album plans or running a sync.

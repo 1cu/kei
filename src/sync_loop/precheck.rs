@@ -335,15 +335,20 @@ pub(super) async fn check_changes_database(
         return WatchPrecheck::SkipAll;
     }
     for library in library_states {
-        if !library.library.last_indexing_finished()
-            || db
-                .get_metadata(&crate::sync_cycle::indexing_reconciliation_key(
-                    &library.zone_name,
-                ))
+        if !library.library.last_indexing_finished() {
+            return WatchPrecheck::proceed_all();
+        }
+        for key in [
+            crate::sync_cycle::indexing_reconciliation_key(&library.zone_name),
+            crate::sync_cycle::indexing_replay_key(&library.zone_name),
+        ] {
+            if db
+                .get_metadata(&key)
                 .await
                 .map_or(true, |hold| hold.is_some())
-        {
-            return WatchPrecheck::proceed_all();
+            {
+                return WatchPrecheck::proceed_all();
+            }
         }
     }
     let scoped_token = match db

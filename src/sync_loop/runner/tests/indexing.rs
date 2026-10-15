@@ -1,6 +1,6 @@
 //! Provisional provider inventories through real cycles, files, and SQLite reopen.
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use base64::Engine;
@@ -32,6 +32,9 @@ struct IndexingSession {
     changes: Arc<Mutex<Vec<String>>>,
     interrupt: Option<CancellationToken>,
     regress_after_query: bool,
+    catalog: Option<Arc<AtomicBool>>,
+    change_records: Arc<Vec<Value>>,
+    reject_cursor: bool,
 }
 
 #[async_trait::async_trait]
@@ -43,24 +46,50 @@ impl PhotosSession for IndexingSession {
                 json!({"records":[{"fields":{"state":{"value":*self.readiness.lock().unwrap()}}}]}),
             );
         }
+        if request["query"]["recordType"] == "CPLAlbumByPositionLive" {
+            let finished = *self.readiness.lock().unwrap() == "FINISHED";
+            let names = if finished { vec!["A", "B"] } else { vec!["A"] };
+            let records: Vec<_> = names.into_iter().map(|name| json!({
+                "recordName":format!("album-{name}"),"recordType":"CPLAlbum",
+                "fields":{"albumNameEnc":{"value":base64::engine::general_purpose::STANDARD.encode(name)}}
+            })).collect();
+            if let Some(catalog) = &self.catalog
+                && catalog.swap(false, Ordering::SeqCst)
+            {
+                *self.readiness.lock().unwrap() = "FINISHED";
+            }
+            return Ok(json!({"records":records}));
+        }
         if url.contains("/changes/zone?") {
             let cursor = request["zones"][0]["syncToken"]
                 .as_str()
                 .unwrap()
                 .to_owned();
             self.changes.lock().unwrap().push(cursor);
+            if self.reject_cursor {
+                return Ok(
+                    json!({"zones":[{"zoneID":{"zoneName":ZONE,"ownerRecordName":"_defaultOwner"},
+                    "serverErrorCode":"BAD_REQUEST","reason":"expired retained cursor","syncToken":"","moreComing":false}]}),
+                );
+            }
             // Deliberately no events for omitted assets: only a full inventory
             // can recover them, even though every incremental request succeeds.
             return Ok(
                 json!({"zones":[{"zoneID":{"zoneName":ZONE,"ownerRecordName":"_defaultOwner"},
-                "records":[],"syncToken":"trusted-after","moreComing":false}]}),
+                "records":self.change_records.as_ref(),"syncToken":"trusted-after","moreComing":false}]}),
             );
         }
         if url.contains("/records/lookup?") {
             return Ok(json!({"records":self.records.as_ref()}));
         }
         if url.contains("/records/query/batch?") {
-            return Ok(album_count_response((self.records.len() / 2) as u64));
+            return Ok(album_count_response(
+                if self.catalog.is_some() && body.contains("album-A") {
+                    0
+                } else {
+                    (self.records.len() / 2) as u64
+                },
+            ));
         }
         assert!(url.contains("/records/query?"), "{url}");
         self.queries.fetch_add(1, Ordering::SeqCst);
@@ -78,7 +107,7 @@ impl PhotosSession for IndexingSession {
             .and_then(|f| f["fieldValue"]["value"].as_u64())
             .unwrap_or(0);
         Ok(
-            json!({"records":if offset == 0 { self.records.as_ref().clone() } else { Vec::new() },
+            json!({"records":if offset == 0 && !(self.catalog.is_some() && body.contains("album-A")) { self.records.as_ref().clone() } else { Vec::new() },
             "syncToken":"query-candidate"}),
         )
     }
@@ -111,6 +140,9 @@ fn provider(readiness: &'static str, ids: &[&str], base: &str) -> IndexingSessio
         changes: Arc::new(Mutex::new(Vec::new())),
         interrupt: None,
         regress_after_query: false,
+        catalog: None,
+        change_records: Arc::new(Vec::new()),
+        reject_cursor: false,
     }
 }
 
@@ -208,7 +240,7 @@ async fn indexing_restart_recovers_omitted_assets_and_reuses_downloaded_files() 
         );
         assert_eq!(
             inner.get_metadata(CURSOR).await.unwrap().as_deref(),
-            Some(if step < 3 {
+            Some(if step < 4 {
                 "query-candidate"
             } else {
                 "trusted-after"
@@ -220,14 +252,24 @@ async fn indexing_restart_recovers_omitted_assets_and_reuses_downloaded_files() 
         );
         assert_eq!(
             result.can_advance_database_checkpoint(),
-            step != 1 && step != 2
+            step == 0 || step == 4
         );
         if step == 1 || step == 2 {
             assert!(provider.changes.lock().unwrap().is_empty());
         }
         if step == 3 {
             assert!(provider.queries.load(Ordering::SeqCst) > 0);
-            assert_eq!(*provider.changes.lock().unwrap(), ["query-candidate"]);
+            assert!(
+                provider.changes.lock().unwrap().is_empty(),
+                "held inventory must defer its bridge"
+            );
+            assert!(
+                inner
+                    .get_metadata(&crate::sync_cycle::indexing_replay_key(ZONE))
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
             assert_eq!(
                 result.stats.downloaded, 1,
                 "reuse both previously downloaded assets"
@@ -240,6 +282,14 @@ async fn indexing_restart_recovers_omitted_assets_and_reuses_downloaded_files() 
                 "steady state uses incremental sync"
             );
             assert_eq!(result.stats.downloaded, 0);
+            assert_eq!(*provider.changes.lock().unwrap(), ["query-candidate"]);
+            assert!(
+                inner
+                    .get_metadata(&crate::sync_cycle::indexing_replay_key(ZONE))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
         }
     }
     server.verify().await;
@@ -291,8 +341,8 @@ async fn indexing_failed_interrupted_or_uncommitted_reconciliation_retains_hold_
         let db: Arc<dyn download::DownloadStore> = if fault == "checkpoint_write" {
             Arc::new(FailingMetadataSetDb::new(
                 raw,
-                MetadataSetFailure::Exact(CURSOR),
-                "injected checkpoint failure",
+                MetadataSetFailure::Prefix(crate::sync_cycle::INDEXING_REPLAY_PREFIX),
+                "injected inventory qualification failure",
             ))
         } else {
             raw
@@ -366,116 +416,178 @@ async fn indexing_failed_interrupted_or_uncommitted_reconciliation_retains_hold_
 
 #[tokio::test]
 async fn indexing_provisional_listing_preserves_membership_pending_rows_and_media() {
-    use crate::commands::{AlbumPass, PassKind};
-    use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig};
-    let root = tempfile::tempdir().unwrap();
-    let database = root.path().join("state.db");
-    let media = root.path().join("media");
-    std::fs::create_dir(&media).unwrap();
-    let media_path = media.join("old.jpg");
-    std::fs::write(&media_path, BYTES).unwrap();
-    let db = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
-    let config = make_run_cycle_config();
-    db.set_metadata(
-        ENUM_CONFIG_HASH_KEY,
-        &download::compute_config_hash(&config),
-    )
-    .await
-    .unwrap();
-    db.set_metadata(CURSOR, "trusted-before").await.unwrap();
-    db.upsert_album_container(ZONE, "trip", "Trip", "album")
-        .await
-        .unwrap();
-    let generation = db
-        .start_album_membership_snapshot(ZONE, "trip", None)
-        .await
-        .unwrap();
-    db.add_album_membership_to_snapshot(ZONE, "trip", generation, "asset-old", Some("old"), "full")
-        .await
-        .unwrap();
-    db.complete_album_membership_snapshot(ZONE, "trip", generation)
-        .await
-        .unwrap();
-    for id in ["old", "pending-omitted"] {
-        db.upsert_seen(
-            &crate::test_helpers::TestAssetRecord::new(id)
-                .library(ZONE)
-                .build(),
+    for scenario in ["RUNNING", "REGRESSED", "QUALIFIED"] {
+        let readiness = if scenario == "RUNNING" {
+            "RUNNING"
+        } else {
+            "FINISHED"
+        };
+        use crate::commands::{AlbumPass, PassKind};
+        use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig};
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("state.db");
+        let media = root.path().join("media");
+        std::fs::create_dir(&media).unwrap();
+        let media_path = media.join("old.jpg");
+        std::fs::write(&media_path, BYTES).unwrap();
+        let db = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+        let config = make_run_cycle_config();
+        db.set_metadata(
+            ENUM_CONFIG_HASH_KEY,
+            &download::compute_config_hash(&config),
         )
         .await
         .unwrap();
-    }
-    db.mark_downloaded(ZONE, "old", "original", &media_path, "local-checksum", None)
+        db.set_metadata(CURSOR, "trusted-before").await.unwrap();
+        db.upsert_album_container(ZONE, "trip", "Trip", "album")
+            .await
+            .unwrap();
+        let generation = db
+            .start_album_membership_snapshot(ZONE, "trip", None)
+            .await
+            .unwrap();
+        db.add_album_membership_to_snapshot(
+            ZONE,
+            "trip",
+            generation,
+            "asset-old",
+            Some("old"),
+            "full",
+        )
         .await
         .unwrap();
-    let provider = provider("RUNNING", &[], "http://unused.invalid");
-    let mut library = library(&provider).await;
-    library.plan.passes = vec![AlbumPass {
-        kind: PassKind::Album,
-        album: PhotoAlbum::new(
-            PhotoAlbumConfig {
-                params: Arc::new(HashMap::new()),
-                service_endpoint: Arc::from("https://example.com"),
-                name: Arc::from("Trip"),
-                list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
-                obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
-                query_filter: None,
-                page_size: 100,
-                zone_id: Arc::new(json!({"zoneName":ZONE})),
-                retry_config: retry::RetryConfig::default(),
-                container_id: Some(Arc::from("trip")),
-                cross_zone_sources: Vec::new(),
-            },
-            Box::new(provider.clone()),
-        ),
-        exclude_ids: Arc::default(),
-    }];
-    let store: Arc<dyn download::DownloadStore> = db.clone();
-    let build = make_run_cycle_download_config_builder(&media, store.clone());
-    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
-    let result = run_cycle(
-        &[&library],
-        &config,
-        Some(store.as_ref()),
-        false,
-        &build,
-        download::DownloadControls::download_hidden(),
-        &shared,
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-    assert!(!result.can_advance_database_checkpoint());
-    assert_eq!(std::fs::read(&media_path).unwrap(), BYTES);
-    assert_eq!(
-        db.get_pending()
+        db.complete_album_membership_snapshot(ZONE, "trip", generation)
             .await
-            .unwrap()
-            .iter()
-            .map(|row| row.id.as_ref())
-            .collect::<Vec<_>>(),
-        ["pending-omitted"]
-    );
-    assert!(provider.changes.lock().unwrap().is_empty());
-    drop(build);
-    drop(store);
-    drop(db);
-    let connection = rusqlite::Connection::open(&database).unwrap();
-    let membership:(i64,i64) = connection.query_row("SELECT generation,is_deleted FROM asset_album_memberships WHERE asset_record_name='asset-old'", [], |r|Ok((r.get(0)?,r.get(1)?))).unwrap();
-    assert_eq!(
-        membership,
-        (generation, 0),
-        "absence in provisional listing cannot delete trusted membership"
-    );
-    let snapshots: i64 = connection
-        .query_row("SELECT COUNT(*) FROM album_membership_snapshots", [], |r| {
-            r.get(0)
-        })
+            .unwrap();
+        for id in ["old", "pending-omitted"] {
+            db.upsert_seen(
+                &crate::test_helpers::TestAssetRecord::new(id)
+                    .library(ZONE)
+                    .build(),
+            )
+            .await
+            .unwrap();
+        }
+        db.mark_downloaded(ZONE, "old", "original", &media_path, "local-checksum", None)
+            .await
+            .unwrap();
+        db.set_metadata_capture_revision_for_test(ZONE, "old", state::METADATA_CAPTURE_REVISION);
+        db.set_metadata(&indexing_reconciliation_key(ZONE), "1")
+            .await
+            .unwrap();
+        let mut provider = provider(readiness, &[], "http://unused.invalid");
+        provider.regress_after_query = scenario == "REGRESSED";
+        provider.change_records = Arc::new(vec![json!({
+            "recordName":"asset-old-IN-trip","recordType":"CPLContainerRelation","deleted":true
+        })]);
+        let mut library = library(&provider).await;
+        library.plan.passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: PhotoAlbum::new(
+                PhotoAlbumConfig {
+                    params: Arc::new(HashMap::new()),
+                    service_endpoint: Arc::from("https://example.com"),
+                    name: Arc::from("Trip"),
+                    list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+                    obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+                    query_filter: None,
+                    page_size: 100,
+                    zone_id: Arc::new(json!({"zoneName":ZONE})),
+                    retry_config: retry::RetryConfig::default(),
+                    container_id: Some(Arc::from("trip")),
+                    cross_zone_sources: Vec::new(),
+                },
+                Box::new(provider.clone()),
+            ),
+            exclude_ids: Arc::default(),
+        }];
+        let store: Arc<dyn download::DownloadStore> = db.clone();
+        let build = make_run_cycle_download_config_builder(&media, store.clone());
+        let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+        let result = run_cycle(
+            &[&library],
+            &config,
+            Some(store.as_ref()),
+            false,
+            &build,
+            download::DownloadControls::download_hidden(),
+            &shared,
+            &CancellationToken::new(),
+        )
+        .await
         .unwrap();
-    assert_eq!(
-        snapshots, 1,
-        "provisional queries do not certify album snapshots"
-    );
+        assert!(!result.can_advance_database_checkpoint());
+        assert_eq!(std::fs::read(&media_path).unwrap(), BYTES);
+        assert_eq!(
+            db.get_pending()
+                .await
+                .unwrap()
+                .iter()
+                .map(|row| row.id.as_ref())
+                .collect::<Vec<_>>(),
+            ["pending-omitted"]
+        );
+        assert_eq!(
+            db.get_metadata(CURSOR).await.unwrap().as_deref(),
+            Some("trusted-before")
+        );
+        assert_eq!(
+            db.get_metadata(&indexing_reconciliation_key(ZONE))
+                .await
+                .unwrap()
+                .is_some(),
+            scenario != "QUALIFIED"
+        );
+        assert_eq!(
+            db.get_metadata(&crate::sync_cycle::indexing_replay_key(ZONE))
+                .await
+                .unwrap()
+                .is_some(),
+            scenario == "QUALIFIED"
+        );
+        assert!(provider.changes.lock().unwrap().is_empty());
+        let before = rusqlite::Connection::open(&database).unwrap().query_row::<i64,_,_>(
+            "SELECT is_deleted FROM asset_album_memberships WHERE asset_record_name='asset-old'",[],|r|r.get(0)).unwrap();
+        assert_eq!(
+            before, 0,
+            "even a qualified inventory defers its deletion-capable replay"
+        );
+        if scenario == "QUALIFIED" {
+            run_cycle(
+                &[&library],
+                &config,
+                Some(store.as_ref()),
+                false,
+                &build,
+                download::DownloadControls::download_hidden(),
+                &shared,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(*provider.changes.lock().unwrap(), ["trusted-before"]);
+            assert_eq!(std::fs::read(&media_path).unwrap(), BYTES);
+        }
+        drop(build);
+        drop(store);
+        drop(db);
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        let membership:(i64,i64) = connection.query_row("SELECT generation,is_deleted FROM asset_album_memberships WHERE asset_record_name='asset-old'", [], |r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(
+            membership,
+            (generation, i64::from(scenario == "QUALIFIED")),
+            "deletion is deferred until a previously qualified inventory permits trusted replay"
+        );
+        let snapshots: i64 = connection
+            .query_row("SELECT COUNT(*) FROM album_membership_snapshots", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            snapshots, 1,
+            "provisional queries do not certify album snapshots"
+        );
+    }
 }
 
 #[tokio::test]
@@ -564,5 +676,269 @@ async fn indexing_cross_zone_source_requires_reconciliation_without_permanent_ho
     assert!(
         hold.is_none(),
         "an unrelated source marker cannot recreate a completed selected-zone hold"
+    );
+}
+
+#[tokio::test]
+async fn indexing_retry_only_keeps_hold_until_normal_inventory_recovers_omitted_photo() {
+    let server = wiremock::MockServer::start().await;
+    for id in ["known", "omitted", "late"] {
+        Mock::given(method("GET"))
+            .and(path(format!("/{id}.jpg")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(BYTES))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let database = root.path().join("state.db");
+    let media = root.path().join("media");
+    std::fs::create_dir(&media).unwrap();
+    let config = make_run_cycle_config();
+    let hold = indexing_reconciliation_key(ZONE);
+    {
+        let db = state::SqliteStateDb::open(&database).await.unwrap();
+        db.set_metadata(CURSOR, "trusted-before").await.unwrap();
+        db.set_metadata(
+            ENUM_CONFIG_HASH_KEY,
+            &download::compute_config_hash(&config),
+        )
+        .await
+        .unwrap();
+        db.set_metadata(&hold, "1").await.unwrap();
+        db.upsert_seen(
+            &crate::test_helpers::TestAssetRecord::new("asset-known")
+                .library(ZONE)
+                .build(),
+        )
+        .await
+        .unwrap();
+        db.mark_failed(ZONE, "asset-known", "original", "prior failed transfer")
+            .await
+            .unwrap();
+    }
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    for (round, retry_only) in [true, false, true, false].into_iter().enumerate() {
+        let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+        let db: Arc<dyn download::DownloadStore> = inner.clone();
+        let mut session = provider("FINISHED", &["known", "omitted"], &server.uri());
+        if round >= 2 {
+            session.change_records = provider("FINISHED", &["late"], &server.uri()).records;
+        }
+        let provider = session;
+        let library = library(&provider).await;
+        let base = make_run_cycle_download_config_builder(&media, db.clone());
+        let build = |mode, exclude, groups, zone| {
+            let mut config = base(mode, exclude, groups, zone);
+            Arc::make_mut(&mut config).retry_only = retry_only;
+            config
+        };
+        let result = run_cycle(
+            &[&library],
+            &config,
+            Some(db.as_ref()),
+            retry_only,
+            &build,
+            download::DownloadControls::download_hidden(),
+            &shared,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+        assert_eq!(result.can_advance_database_checkpoint(), round == 3);
+        assert_eq!(
+            inner.get_metadata(CURSOR).await.unwrap().as_deref(),
+            Some(if round < 3 {
+                "trusted-before"
+            } else {
+                "trusted-after"
+            })
+        );
+        assert_eq!(
+            inner.get_metadata(&hold).await.unwrap().is_some(),
+            round == 0
+        );
+        assert_eq!(
+            inner.get_downloaded_page(0, 10).await.unwrap().len(),
+            if round == 0 {
+                1
+            } else if round == 3 {
+                3
+            } else {
+                2
+            }
+        );
+        assert_eq!(
+            inner
+                .get_metadata(&crate::sync_cycle::indexing_replay_key(ZONE))
+                .await
+                .unwrap()
+                .is_some(),
+            round == 1 || round == 2
+        );
+        if round < 2 {
+            assert!(
+                provider.changes.lock().unwrap().is_empty(),
+                "held/retry inventory must retain old cursor"
+            );
+        } else {
+            assert_eq!(*provider.changes.lock().unwrap(), ["trusted-before"]);
+        }
+    }
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn indexing_running_plan_cannot_qualify_after_late_finished_probe() {
+    use crate::icloud::photos::PhotosService;
+    use crate::selection::AlbumSelector;
+    let server = wiremock::MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/omitted.jpg"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(BYTES))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let root = tempfile::tempdir().unwrap();
+    let media = root.path().join("media");
+    std::fs::create_dir(&media).unwrap();
+    let db = Arc::new(
+        state::SqliteStateDb::open(&root.path().join("state.db"))
+            .await
+            .unwrap(),
+    );
+    let mut config = make_run_cycle_config();
+    config.filters.selection.albums = AlbumSelector::All {
+        excluded: Default::default(),
+    };
+    config.filters.selection.unfiled = false;
+    config.filters.selection.albums_explicit = false;
+    db.set_metadata(CURSOR, "trusted-before").await.unwrap();
+    db.set_metadata(
+        ENUM_CONFIG_HASH_KEY,
+        &download::compute_config_hash(&config),
+    )
+    .await
+    .unwrap();
+    let mut provider = provider("RUNNING", &["omitted"], &server.uri());
+    let transition = Arc::new(AtomicBool::new(false));
+    provider.catalog = Some(transition.clone());
+    let primary = library(&provider).await.library;
+    let libraries = vec![primary.clone()];
+    let mut service = PhotosService::for_testing_with_libraries(
+        Box::new(provider.clone()),
+        primary.clone(),
+        HashMap::from([(ZONE.to_owned(), primary)]),
+        HashMap::new(),
+    );
+    let (mut states, mut context) =
+        crate::sync_loop::planning::resolve_library_plans(&mut service, &libraries, &config)
+            .await
+            .unwrap();
+    assert_eq!(states[0].plan.passes.len(), 1);
+    transition.store(true, Ordering::SeqCst);
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    for round in 0..2 {
+        crate::sync_loop::planning::refresh_indexing_library_plans(
+            &mut service,
+            &libraries,
+            &config,
+            Some(db.as_ref()),
+            &mut states,
+            &mut context,
+        )
+        .await
+        .unwrap();
+        assert_eq!(states[0].plan.passes.len(), if round == 0 { 1 } else { 2 });
+        assert_eq!(
+            states[0].plan_is_stale,
+            round == 0,
+            "scope must have FINISHED provenance"
+        );
+        let store: Arc<dyn download::DownloadStore> = db.clone();
+        let build = make_run_cycle_download_config_builder(&media, store.clone());
+        let result = run_cycle(
+            &states.iter().collect::<Vec<_>>(),
+            &config,
+            Some(store.as_ref()),
+            false,
+            &build,
+            download::DownloadControls::download_hidden(),
+            &shared,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+        assert!(!result.can_advance_database_checkpoint());
+        assert_eq!(
+            db.get_metadata(CURSOR).await.unwrap().as_deref(),
+            Some("trusted-before")
+        );
+        assert_eq!(
+            db.get_metadata(&indexing_reconciliation_key(ZONE))
+                .await
+                .unwrap()
+                .is_some(),
+            round == 0
+        );
+        assert_eq!(db.get_downloaded_page(0, 10).await.unwrap().len(), round);
+        assert!(provider.changes.lock().unwrap().is_empty());
+    }
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn indexing_qualified_replay_keeps_expired_trusted_cursor_and_recovery_debt() {
+    let root = tempfile::tempdir().unwrap();
+    let db = Arc::new(
+        state::SqliteStateDb::open(&root.path().join("state.db"))
+            .await
+            .unwrap(),
+    );
+    let config = make_run_cycle_config();
+    db.set_metadata(
+        ENUM_CONFIG_HASH_KEY,
+        &download::compute_config_hash(&config),
+    )
+    .await
+    .unwrap();
+    db.set_metadata(CURSOR, "trusted-before").await.unwrap();
+    let replay = crate::sync_cycle::indexing_replay_key(ZONE);
+    db.set_metadata(&replay, "1").await.unwrap();
+    let mut provider = provider("FINISHED", &[], "http://unused.invalid");
+    provider.reject_cursor = true;
+    let library = library(&provider).await;
+    let store: Arc<dyn download::DownloadStore> = db.clone();
+    let build = make_run_cycle_download_config_builder(root.path(), store.clone());
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let result = run_cycle(
+        &[&library],
+        &config,
+        Some(store.as_ref()),
+        false,
+        &build,
+        download::DownloadControls::download_hidden(),
+        &shared,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(!result.can_advance_database_checkpoint());
+    assert_eq!(
+        db.get_metadata(CURSOR).await.unwrap().as_deref(),
+        Some("trusted-before")
+    );
+    assert_eq!(
+        db.get_metadata(&replay).await.unwrap().as_deref(),
+        Some("1")
+    );
+    assert!(
+        db.get_metadata("retained_checkpoint_hold:PrimarySync")
+            .await
+            .unwrap()
+            .is_some(),
+        "qualified inventory cannot waive the retained-history gate when replay rejects its cursor"
     );
 }

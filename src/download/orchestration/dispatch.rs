@@ -315,7 +315,7 @@ async fn download_photos_with_sync_inner(
                     Some(db) => !db.has_primary_layouts(&config.library).await?,
                     None => true,
                 },
-            "Provisional indexing downloads must wait for FINISHED when managed primary layouts are enabled"
+            "Unqualified indexing recovery cannot certify managed primary replacement coverage"
         );
         return download_photos_full_with_token_policy(
             download_client,

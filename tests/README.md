@@ -730,7 +730,12 @@ FINISHED recovery with an empty change feed, verified file reuse, and a steady
 incremental cycle. Failure cases retain the trusted cursor and durable hold after
 malformed inventory, interruption, checkpoint-write failure, readiness regression,
 and unknown readiness. A seeded complete album snapshot and pending row prove
-that provisional absence does not retire membership, retry state, or media.
+that provisional absence does not retire membership, retry state, or media,
+including FINISHED inventory that regresses during listing. A real relation
+tombstone is applied only in the later trusted replay after inventory
+qualification. Retry-only known failures cannot hide unqueued omitted assets;
+a RUNNING album-plan transition must rebuild the omitted album after FINISHED.
+File-backed replay debt also bypasses an otherwise quiet watch pre-check.
 
 ## Running
 

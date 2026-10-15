@@ -621,15 +621,31 @@ and durable finalization path. Managed primary layouts wait for `FINISHED`.
 Watch cycles with a hold bypass the database no-change shortcut and rebuild
 collection and album plans so omitted albums can reappear after indexing.
 
-A retained hold forces full reconciliation after `FINISHED`. A prior trusted
-cursor is replayed after the complete inventory to bridge concurrent changes;
-its rejection retains the existing checkpoint-evidence hold. Bounded coverage,
-interruption, transfer/metadata failure, stale plans, missing proof, state-write
-failure, or readiness regression cannot clear the indexing obligation. Hold
-removal and trusted token promotion share a fenced checkpoint transaction,
-including aggregate config-drift promotion. Provisional inventory cannot replace
-a comparable inventory anchor. Readiness probes are observations, not an atomic
-snapshot guarantee from Apple.
+A retained hold forces full reconciliation after `FINISHED`. A scope refreshed
+while readiness is `RUNNING` remains stale even if the cycle's later probe says
+`FINISHED`; the next wake rebuilds it after readiness. Retry-only inventory can
+download known failed work but cannot discharge recovery of previously omitted
+assets. The held full-query path continues to suppress deletion-capable
+maintenance, album snapshot completion, and the retained-token bridge even when
+its initial probe reports `FINISHED`.
+
+Complete natural EOF, successful local work, a fresh FINISHED scope, and a final
+FINISHED probe qualify that inventory. One fenced transaction removes
+`indexing_reconciliation_required:<zone>` and writes
+`indexing_replay_required:<zone>` without moving the trusted source cursor or
+database cursor. The later trusted cycle replays the old cursor and applies
+source deletions. Replay presence, including an unknown future payload, bypasses
+the watch database shortcut across reopen. Only normal checkpoint promotion
+removes replay debt, including aggregate config-drift promotion. Rejection of
+the retained cursor preserves the existing checkpoint gates.
+
+Bounded coverage, interruption, retry-only selection, failed transfers or
+metadata, stale scope, missing proof, state-write failure, and readiness
+regression cannot qualify an inventory or advance its cursor. Provisional
+inventory cannot replace a comparable inventory anchor. Managed primary layouts
+remain excluded from the unqualified download-only path; independent safe
+managed-layout recovery needs separate qualification. Readiness probes are
+observations, not an atomic snapshot guarantee from Apple.
 
 Inventory-drop diagnostics use a complete count measurement from the initial
 full-query invocation, captured before activity and delta-bridge composition.
