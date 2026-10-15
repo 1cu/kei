@@ -1897,6 +1897,7 @@ mod wiremock_tests {
             state_db: None,
             retry_only: false,
             provisional: false,
+            indexing_inventory_only: false,
             max_download_attempts: 0,
             sync_mode: SyncMode::Full,
             enum_config_hash: None,

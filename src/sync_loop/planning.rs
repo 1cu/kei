@@ -406,6 +406,14 @@ pub(super) async fn refresh_indexing_library_plans(
             crate::sync_cycle::prepare_library_indexing(library, state_db, config.runtime.dry_run)
                 .await?;
         indexing_hold |= hold.is_some();
+        if let Some(db) = state_db {
+            indexing_hold |= db
+                .get_metadata(&crate::sync_cycle::indexing_materialization_key(
+                    &library.zone_name,
+                ))
+                .await?
+                .is_some();
+        }
         finished_before_scope &= finished;
     }
     if indexing_hold {

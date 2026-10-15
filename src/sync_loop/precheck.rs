@@ -341,6 +341,7 @@ pub(super) async fn check_changes_database(
         for key in [
             crate::sync_cycle::indexing_reconciliation_key(&library.zone_name),
             crate::sync_cycle::indexing_replay_key(&library.zone_name),
+            crate::sync_cycle::indexing_materialization_key(&library.zone_name),
         ] {
             if db
                 .get_metadata(&key)

@@ -309,12 +309,13 @@ async fn download_photos_with_sync_inner(
         // Do not turn incomplete listings/lookups into deletion, membership,
         // generation activation, retry retirement, or incremental evidence.
         // Managed replacement needs independently certified current coverage.
+        let managed = config.edited_naming == crate::types::EditedNaming::Primary
+            || match &config.state_db {
+                Some(db) => db.has_primary_layouts(&config.library).await?,
+                None => false,
+            };
         anyhow::ensure!(
-            config.edited_naming != crate::types::EditedNaming::Primary
-                && match &config.state_db {
-                    Some(db) => !db.has_primary_layouts(&config.library).await?,
-                    None => true,
-                },
+            !managed || config.indexing_inventory_only,
             "Unqualified indexing recovery cannot certify managed primary replacement coverage"
         );
         return download_photos_full_with_token_policy(

@@ -13,9 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Downloads can progress when iCloud Photos reports `RUNNING` indexing. These runs remain provisional: kei preserves trusted sync tokens, retains a per-library reconciliation requirement across restarts, and suppresses deletion and membership decisions from provisional listings. After `FINISHED`, a complete inventory and final readiness check qualify recovery without moving the trusted cursor; the next trusted cycle replays that retained cursor before advancing it. Existing verified downloads are reused. ([#951](https://github.com/rhoopr/kei/issues/951#issuecomment-6173266761))
 
+- Managed layouts retain the RUNNING guard, qualify FINISHED inventory without local writes, then require full protected materialization and retained-cursor replay across restarts.
+- Updated locked Rustls to 0.23.46 for RUSTSEC-2026-0346 through RUSTSEC-2026-0349. Existing audit policy is unchanged.
+
 ### Known limitations
 
-- Managed `photos.edited_naming = "primary"` layouts remain excluded from unqualified indexing recovery because provisional inventory cannot certify replacement coverage. Missing or unknown indexing responses still fail closed. Bounded, interrupted, failed, or uncommitted reconciliation keeps the hold. See [v0.25.2 upgrade guidance](docs/v0.25.2-upgrade.md).
+- Missing or unknown indexing responses fail closed. Bounded, interrupted, failed, or uncommitted reconciliation keeps the hold. Managed layouts wait during RUNNING; full selected coverage and successful protected materialization are required after FINISHED. See [v0.25.2 upgrade guidance](docs/v0.25.2-upgrade.md).
 
 ## [0.25.1] - 2026-10-13
 

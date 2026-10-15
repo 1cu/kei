@@ -737,6 +737,18 @@ qualification. Retry-only known failures cannot hide unqueued omitted assets;
 a RUNNING album-plan transition must rebuild the omitted album after FINISHED.
 File-backed replay debt also bypasses an otherwise quiet watch pre-check.
 
+`primary_layout::indexing` additionally starts with real managed files or an
+interrupted journal, reopens SQLite between phases, and proves RUNNING remains
+blocked under primary and recorded-layout suffix modes. FINISHED inventory is
+read-only with exact media/sidecar/journal/catalogue oracles; durable full
+materialization recovers previously unqueued assets with an empty change feed.
+Inventory faults cover regression, cancellation, bounds, stale planning, invalid
+identity, missing token and atomic transition failure. Publication faults retain
+full debt/cursor through failed transfers, checkpoint writes, cancellation,
+bounds and regression. Pending-only journals remain managed under suffix;
+local edits, foreign collisions and sidecars retain the normal protection owners.
+
+
 ## Running
 
 Choose the route by purpose:

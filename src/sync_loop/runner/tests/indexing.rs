@@ -942,3 +942,66 @@ async fn indexing_qualified_replay_keeps_expired_trusted_cursor_and_recovery_deb
         "qualified inventory cannot waive the retained-history gate when replay rejects its cursor"
     );
 }
+
+#[tokio::test]
+async fn indexing_materialization_debt_refreshes_finished_scope_after_reopen() {
+    use crate::icloud::photos::PhotosService;
+    use crate::selection::AlbumSelector;
+    let root = tempfile::tempdir().unwrap();
+    let database = root.path().join("state.db");
+    {
+        let db = state::SqliteStateDb::open(&database).await.unwrap();
+        db.set_metadata(
+            &crate::sync_cycle::indexing_materialization_key(ZONE),
+            "future-version",
+        )
+        .await
+        .unwrap();
+    }
+    let db = state::SqliteStateDb::open(&database).await.unwrap();
+    let mut config = make_run_cycle_config();
+    config.filters.selection.albums = AlbumSelector::All {
+        excluded: Default::default(),
+    };
+    config.filters.selection.unfiled = false;
+    config.filters.selection.albums_explicit = false;
+    let mut provider = provider("FINISHED", &[], "http://unused.invalid");
+    provider.catalog = Some(Arc::new(AtomicBool::new(false)));
+    let primary = library(&provider).await.library;
+    let libraries = vec![primary.clone()];
+    let mut service = PhotosService::for_testing_with_libraries(
+        Box::new(provider),
+        primary.clone(),
+        HashMap::from([(ZONE.to_owned(), primary)]),
+        HashMap::new(),
+    );
+    let (mut states, mut context) =
+        crate::sync_loop::planning::resolve_library_plans(&mut service, &libraries, &config)
+            .await
+            .unwrap();
+    assert_eq!(states[0].plan.passes.len(), 2);
+    states[0].plan.passes.truncate(1);
+    crate::sync_loop::planning::refresh_indexing_library_plans(
+        &mut service,
+        &libraries,
+        &config,
+        Some(&db),
+        &mut states,
+        &mut context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        states[0].plan.passes.len(),
+        2,
+        "full materialization must rebuild the selected scope even without a reconciliation marker"
+    );
+    assert!(!states[0].plan_is_stale);
+    assert_eq!(
+        db.get_metadata(&crate::sync_cycle::indexing_materialization_key(ZONE))
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("future-version")
+    );
+}

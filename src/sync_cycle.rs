@@ -73,6 +73,12 @@ pub(crate) fn indexing_replay_key(zone: &str) -> String {
     format!("{INDEXING_REPLAY_PREFIX}{zone}")
 }
 
+/// Managed qualification did not queue files. This obligation forces a full
+/// managed publication pass before retained-cursor replay may discharge it.
+pub(crate) fn indexing_materialization_key(zone: &str) -> String {
+    format!("indexing_materialization_required:{zone}")
+}
+
 /// Observe readiness and durably retain every RUNNING observation, even if a
 /// later readiness request fails before enumeration starts.
 pub(crate) async fn prepare_indexing_reconciliation(
@@ -1125,7 +1131,18 @@ pub(crate) async fn run_cycle(
             None => None,
         };
         let indexing_replay_pending = replay_at_start.is_some();
+        let materialization_key = indexing_materialization_key(&lib_state.zone_name);
+        let materialization_at_start = match state_db {
+            Some(db) => db.get_metadata(&materialization_key).await?,
+            None => None,
+        };
+        let indexing_materialization_pending = materialization_at_start.is_some();
         let mut zone_metadata_fence = enum_metadata_at_start.clone();
+        zone_metadata_fence.push((
+            materialization_key.clone(),
+            materialization_at_start.clone(),
+        ));
+        active_cursor_fences.push((materialization_key.clone(), materialization_at_start));
         zone_metadata_fence.push((indexing_key.clone(), indexing_hold_at_start.clone()));
         zone_metadata_fence.push((replay_key.clone(), replay_at_start.clone()));
         active_cursor_fences.push((replay_key.clone(), replay_at_start));
@@ -1283,7 +1300,7 @@ pub(crate) async fn run_cycle(
             } else {
                 None
             };
-        let sync_mode_decision = if indexing_reconciliation {
+        let sync_mode_decision = if indexing_reconciliation || indexing_materialization_pending {
             SyncModeDecision {
                 mode: download::SyncMode::Full,
                 full_enumeration_reason: Some(download::FullEnumerationReason::OtherStaticReason),
@@ -1385,6 +1402,14 @@ pub(crate) async fn run_cycle(
         // full scope and its final readiness check have qualified.
         Arc::make_mut(&mut download_config).provisional =
             indexing_reconciliation || !indexing_finished;
+        let managed_indexing_recovery = indexing_reconciliation
+            && (download_config.edited_naming == crate::types::EditedNaming::Primary
+                || match state_db {
+                    Some(db) => db.has_primary_layouts(&lib_state.zone_name).await?,
+                    None => false,
+                });
+        Arc::make_mut(&mut download_config).indexing_inventory_only =
+            managed_indexing_recovery && indexing_finished;
         if pending_download_config_hash.is_some() && path_reconciliation_has_smart_folders {
             Arc::make_mut(&mut download_config).complete_path_selection = true;
         }
@@ -1501,12 +1526,21 @@ pub(crate) async fn run_cycle(
         if (matches!(enum_config_hash_outcome, EnumConfigHashOutcome::Changed)
             || unresolved_identity
             || legacy_cycle.requires_inventory()
-            || (indexing_replay_pending && !is_retry_failed && !download_config.retry_only))
+            || ((indexing_replay_pending || indexing_materialization_pending)
+                && !is_retry_failed
+                && !download_config.retry_only))
             && indexing_finished
             && !indexing_reconciliation
             && sync_result.full_enumeration_ran
             && !sync_result.checkpoint.completed_delta_replay
             && checkpoint_transition_state_safe
+            && (!indexing_materialization_pending
+                || (matches!(sync_result.outcome, download::DownloadOutcome::Success)
+                    && sync_result.stats.failed == 0
+                    && sync_result.stats.exif_failures == 0
+                    && download_config.recent.is_none()
+                    && download_config.skip_created_before.is_none()
+                    && download_config.skip_created_after.is_none()))
         {
             let prior_token = retained_cursor_at_start.clone();
             if let Some(prior_token) = prior_token.filter(|token| !token.trim().is_empty()) {
@@ -1743,7 +1777,9 @@ pub(crate) async fn run_cycle(
         }
         // Retry-only work cannot discharge either phase: new assets may be
         // skipped before they acquire durable retry rows. Keep their cursor.
-        let recovery_retry_only = (indexing_reconciliation || indexing_replay_pending)
+        let recovery_retry_only = (indexing_reconciliation
+            || indexing_replay_pending
+            || indexing_materialization_pending)
             && (is_retry_failed || download_config.retry_only);
         if recovery_retry_only
             || (indexing_reconciliation
@@ -1760,6 +1796,27 @@ pub(crate) async fn run_cycle(
                 sync_result.stats.sync_token_blocked_explanation =
                     Some("retry-only processing cannot discharge retained-cursor replay");
             }
+        }
+
+        // An inventory-only pass queued nothing. Unlike ordinary durable
+        // transfer retries, managed recovery cannot release its full-work debt
+        // until every selected publication and its retained bridge succeeds.
+        if indexing_materialization_pending
+            && !indexing_reconciliation
+            && (!library_completed_without_errors
+                || !sync_result.full_enumeration_ran
+                || sync_result.stats.failed > 0
+                || sync_result.stats.exif_failures > 0
+                || download_config.recent.is_some()
+                || download_config.skip_created_before.is_some()
+                || download_config.skip_created_after.is_some()
+                || (retained_cursor_at_start
+                    .as_ref()
+                    .is_some_and(|s| !s.trim().is_empty())
+                    && !matches!(checkpoint_basis, CheckpointBasis::InventoryWithDeltaBridge)))
+        {
+            sync_result.checkpoint.sync_token_blocked = true;
+            sync_result.checkpoint.project(&mut sync_result.stats);
         }
 
         // Provider cursor safety is independent from transfer completion.
@@ -1806,18 +1863,26 @@ pub(crate) async fn run_cycle(
                 && indexing_finished
                 && sync_result.full_enumeration_ran
                 && library_completed_without_errors
+                && (!managed_indexing_recovery
+                    || (matches!(readiness_after, Some(Ok(true)))
+                        && download_config.recent.is_none()
+                        && download_config.skip_created_before.is_none()
+                        && download_config.skip_created_after.is_none()))
                 && let Some(db) = state_db
             {
-                // Qualify the inventory without adopting its cursor. Retain
-                // the last trusted cursor so the next trusted incremental
-                // cycle bridges concurrent changes and applies deletions.
+                // Qualify coverage without adopting its cursor. Managed
+                // inventory queued no files, so retain separate full-work debt.
+                let mut obligations = vec![(replay_key.clone(), "1".to_owned())];
+                if managed_indexing_recovery {
+                    obligations.push((materialization_key.clone(), "1".to_owned()));
+                }
                 match db
                     .commit_checkpoint_transition(state::CheckpointTransition {
                         expected_metadata: zone_metadata_fence.clone(),
                         legacy_preservation_proofs: Vec::new(),
                         legacy_config_hash: None,
                         sparse_identity_proofs: Vec::new(),
-                        metadata_updates: vec![(replay_key.clone(), "1".to_owned())],
+                        metadata_updates: obligations,
                         metadata_deletes: vec![indexing_key.clone()],
                     })
                     .await
@@ -1847,11 +1912,15 @@ pub(crate) async fn run_cycle(
                 "indexing_reconciliation_required"
             });
             sync_result.stats.sync_token_blocked_source = Some("kei");
-            sync_result.stats.sync_token_blocked_explanation = Some(if qualified {
-                "full inventory qualified; the old trusted cursor is retained for the next incremental cycle"
-            } else {
-                "a complete non-retry inventory from a FINISHED plan is still required"
-            });
+            sync_result.stats.sync_token_blocked_explanation = Some(
+                if qualified && managed_indexing_recovery {
+                    "managed inventory qualified; full protected materialization and retained-cursor replay are still required"
+                } else if qualified {
+                    "full inventory qualified; the old trusted cursor is retained for the next incremental cycle"
+                } else {
+                    "a complete non-retry inventory from a FINISHED plan is still required"
+                },
+            );
             db_sync_token_advance_safe = false;
             path_reconciliation_complete = false;
             path_reconciliation_cycle_safe = false;
@@ -1991,6 +2060,7 @@ pub(crate) async fn run_cycle(
                                     retained_checkpoint_hold_key(&lib_state.zone_name),
                                     indexing_key.clone(),
                                     replay_key.clone(),
+                                    materialization_key.clone(),
                                 ],
                             })
                             .await
@@ -2203,6 +2273,7 @@ pub(crate) async fn run_cycle(
                 metadata_deletes.push(state::unresolved_identity_key(&lib_state.zone_name));
                 metadata_deletes.push(indexing_reconciliation_key(&lib_state.zone_name));
                 metadata_deletes.push(indexing_replay_key(&lib_state.zone_name));
+                metadata_deletes.push(indexing_materialization_key(&lib_state.zone_name));
             }
             if db_sync_token_advance_safe {
                 metadata_updates.push((ENUM_CONFIG_HASH_KEY.to_owned(), enum_config_hash));

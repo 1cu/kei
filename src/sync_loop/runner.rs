@@ -484,6 +484,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             selection_pass: None,
             retry_only: is_retry_failed,
             provisional: false,
+            indexing_inventory_only: false,
             max_download_attempts: config.retry.max_download_attempts,
             sync_mode,
             enum_config_hash: Some(Arc::clone(&enum_config_hash)),

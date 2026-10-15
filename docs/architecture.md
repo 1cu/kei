@@ -642,10 +642,29 @@ the retained cursor preserves the existing checkpoint gates.
 Bounded coverage, interruption, retry-only selection, failed transfers or
 metadata, stale scope, missing proof, state-write failure, and readiness
 regression cannot qualify an inventory or advance its cursor. Provisional
-inventory cannot replace a comparable inventory anchor. Managed primary layouts
-remain excluded from the unqualified download-only path; independent safe
-managed-layout recovery needs separate qualification. Readiness probes are
-observations, not an atomic snapshot guarantee from Apple.
+inventory cannot replace a comparable inventory anchor.
+
+Managed primary configuration, recorded bindings and pending operations retain
+the RUNNING guard, including a later suffix configuration. Once FINISHED, the
+held phase uses the same full-enumeration owner and token/EOF evidence, but
+only consumes validated provider identities. It does not invoke local task
+planning, journal recovery, publication, metadata drains, retry retirement or
+snapshot pruning. A fresh FINISHED plan, unbounded selected scope, valid token
+and final FINISHED observations from every source qualify that inventory.
+The fenced transition additionally writes
+`indexing_materialization_required:<zone>`. Presence, including unknown payloads,
+forces a fresh full managed materialization through the existing journal and
+publication owners before retained-cursor replay. It bypasses quiet watch
+shortcuts and refreshes plans across restarts. An empty change feed therefore
+cannot omit assets that inventory-only qualification never queued.
+
+Managed materialization debt survives retry-only/bounded runs, failed transfers,
+metadata failure, interruption, regression and checkpoint-write failure. When an
+old cursor exists, both full publication and its incremental bridge must qualify
+before one checkpoint transaction removes materialization and replay debt.
+Existing local-byte, collision, sidecar, ownership and interrupted-journal guards
+still control every managed write. Readiness probes are observations, not an
+atomic snapshot guarantee from Apple.
 
 Inventory-drop diagnostics use a complete count measurement from the initial
 full-query invocation, captured before activity and delta-bridge composition.
