@@ -1692,8 +1692,11 @@ pub(crate) async fn run_cycle(
                 Ok::<_, crate::icloud::error::ICloudError>(finished)
             } => Some(result),
         };
-        let indexing_safe = indexing_finished && matches!(readiness_after, Some(Ok(true)));
-        if !indexing_safe {
+        // Cancellation is not an indexing observation. Preserve existing debt,
+        // but do not turn ordinary interrupted sync into a new indexing hold.
+        let indexing_hold_required =
+            !indexing_finished || matches!(readiness_after, Some(Ok(false)) | Some(Err(_)));
+        if indexing_hold_required {
             if !config.runtime.dry_run
                 && let Some(db) = state_db
             {

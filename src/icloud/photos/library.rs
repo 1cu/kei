@@ -157,10 +157,20 @@ impl PhotoLibrary {
         Ok(library)
     }
 
-    /// The last observed readiness is not checkpoint authority. The cycle
-    /// rechecks before enumeration and before committing a candidate.
+    /// Remembered readiness is not checkpoint authority. False also retains
+    /// an earlier RUNNING observation across owner qualification. The cycle
+    /// persists that obligation before rechecking readiness.
     pub(crate) fn last_indexing_finished(&self) -> bool {
         self.indexing_finished.load(Ordering::Relaxed)
+    }
+
+    /// Qualification can replace a name-only library after another readiness
+    /// probe. Keep any earlier RUNNING observation until the cycle persists its
+    /// hold before checking readiness again.
+    pub(super) fn retain_provisional_readiness_from(&self, prior: &Self) {
+        if !prior.last_indexing_finished() {
+            self.indexing_finished.store(false, Ordering::Relaxed);
+        }
     }
 
     pub(crate) async fn check_indexing(&self) -> Result<bool, ICloudError> {

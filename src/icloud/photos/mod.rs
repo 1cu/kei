@@ -416,6 +416,9 @@ impl PhotosService {
             tracing::error!(zone = %zone_name, error = %error, "Failed to load library zone");
             anyhow::anyhow!("Could not load iCloud Photos library zone {zone_name}: {error}")
         })?;
+        if library_type == "private" && zone_name == PRIMARY_ZONE_NAME {
+            library.retain_provisional_readiness_from(&self.primary_library);
+        }
         crate::support::observe(
             "support_discovery_v1",
             json!({
@@ -951,6 +954,72 @@ mod tests {
         assert_eq!(service.all_libraries().await.unwrap().len(), 3);
         assert_eq!(session.indexing_requests.lock().unwrap().len(), requests);
         assert_eq!(session.discovery.listings.lock().unwrap().len(), 2);
+    }
+
+    #[derive(Clone)]
+    struct InitialRunningSession {
+        checks: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl PhotosSession for InitialRunningSession {
+        async fn post(&self, url: &str, body: String, _: &[(&str, &str)]) -> anyhow::Result<Value> {
+            if url.contains("/zones/list") {
+                return Ok(
+                    json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}}]}),
+                );
+            }
+            let request: Value = serde_json::from_str(&body)?;
+            assert_eq!(request["query"]["recordType"], "CheckIndexingState");
+            let first = self
+                .checks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 0;
+            Ok(
+                json!({"records":[{"fields":{"state":{"value":if first {"RUNNING"} else {"FINISHED"}}}}]}),
+            )
+        }
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn indexing_running_observation_survives_primary_owner_qualification() {
+        let session = InitialRunningSession {
+            checks: Arc::default(),
+        };
+        let mut service = PhotosService::new(
+            "https://example.com".into(),
+            Box::new(session),
+            HashMap::new(),
+            RetryConfig::default(),
+        )
+        .await
+        .unwrap();
+        let library = service.get_library(PRIMARY_ZONE_NAME).await.unwrap();
+        assert!(library.is_private_default_owner());
+        assert!(
+            !library.last_indexing_finished(),
+            "qualified FINISHED probe must retain earlier RUNNING evidence"
+        );
+        let db = crate::state::SqliteStateDb::open_in_memory().unwrap();
+        let (finished, hold) =
+            crate::sync_cycle::prepare_indexing_reconciliation(library, Some(&db), false)
+                .await
+                .unwrap();
+        assert!(finished);
+        assert!(hold.is_some());
+        assert_eq!(
+            db.get_metadata(&crate::sync_cycle::indexing_reconciliation_key(
+                PRIMARY_ZONE_NAME
+            ))
+            .await
+            .unwrap()
+            .as_deref(),
+            Some("1")
+        );
+        assert!(library.last_indexing_finished());
     }
 
     #[tokio::test]
