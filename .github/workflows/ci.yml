@@ -1,6 +1,11 @@
 name: Rust CI
+run-name: "${{ github.event_name == 'workflow_dispatch' && 'v0.25.2 exact-source qualification (a7fb218)' || github.workflow }}"
+
+# CI-control branch only: manual jobs test the reviewed source, not this
+# workflow-control commit. Normal PR/main behavior remains unchanged.
 
 on:
+  workflow_dispatch:
   pull_request:
   push:
     branches: [main]
@@ -15,6 +20,8 @@ permissions:
   contents: read
 
 env:
+  QUALIFICATION_SHA: "a7fb2188918eb08db2d85111c636310c28ae108e"
+  QUALIFICATION_TREE: "e64d8634a2ada8d3c24ef648c93ff60a80591670"
   CARGO_TERM_COLOR: always
   RUST_STABLE_TOOLCHAIN: "1.94.1"
   RUST_NIGHTLY_TOOLCHAIN: "nightly-2026-05-15"
@@ -36,7 +43,16 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && env.QUALIFICATION_SHA || github.ref }}
+          persist-credentials: false
           fetch-depth: 0
+      - name: Verify qualification source
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$QUALIFICATION_SHA"
+          test "$(git rev-parse HEAD^{tree})" = "$QUALIFICATION_TREE"
+          git rev-parse HEAD HEAD^{tree}
       - id: filter
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -93,6 +109,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && env.QUALIFICATION_SHA || github.ref }}
+          persist-credentials: false
+      - name: Verify qualification source
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$QUALIFICATION_SHA"
+          test "$(git rev-parse HEAD^{tree})" = "$QUALIFICATION_TREE"
+          git rev-parse HEAD HEAD^{tree}
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
@@ -109,7 +135,16 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && env.QUALIFICATION_SHA || github.ref }}
+          persist-credentials: false
           fetch-depth: 0
+      - name: Verify qualification source
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$QUALIFICATION_SHA"
+          test "$(git rev-parse HEAD^{tree})" = "$QUALIFICATION_TREE"
+          git rev-parse HEAD HEAD^{tree}
       - run: bash scripts/check-roundtrip-gate.sh
 
   # Catches common mistakes, unidiomatic code, and potential bugs
@@ -121,6 +156,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && env.QUALIFICATION_SHA || github.ref }}
+          persist-credentials: false
+      - name: Verify qualification source
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$QUALIFICATION_SHA"
+          test "$(git rev-parse HEAD^{tree})" = "$QUALIFICATION_TREE"
+          git rev-parse HEAD HEAD^{tree}
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
@@ -141,6 +186,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && env.QUALIFICATION_SHA || github.ref }}
+          persist-credentials: false
+      - name: Verify qualification source
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$QUALIFICATION_SHA"
+          test "$(git rev-parse HEAD^{tree})" = "$QUALIFICATION_TREE"
+          git rev-parse HEAD HEAD^{tree}
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
@@ -171,6 +226,16 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && env.QUALIFICATION_SHA || github.ref }}
+          persist-credentials: false
+      - name: Verify qualification source
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$QUALIFICATION_SHA"
+          test "$(git rev-parse HEAD^{tree})" = "$QUALIFICATION_TREE"
+          git rev-parse HEAD HEAD^{tree}
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
@@ -205,6 +270,16 @@ jobs:
       RUSTDOCFLAGS: "-Dwarnings"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && env.QUALIFICATION_SHA || github.ref }}
+          persist-credentials: false
+      - name: Verify qualification source
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$QUALIFICATION_SHA"
+          test "$(git rev-parse HEAD^{tree})" = "$QUALIFICATION_TREE"
+          git rev-parse HEAD HEAD^{tree}
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
@@ -227,6 +302,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && env.QUALIFICATION_SHA || github.ref }}
+          persist-credentials: false
+      - name: Verify qualification source
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$QUALIFICATION_SHA"
+          test "$(git rev-parse HEAD^{tree})" = "$QUALIFICATION_TREE"
+          git rev-parse HEAD HEAD^{tree}
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
         with:
           toolchain: ${{ env.RUST_NIGHTLY_TOOLCHAIN }}
@@ -243,6 +328,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && env.QUALIFICATION_SHA || github.ref }}
+          persist-credentials: false
+      - name: Verify qualification source
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$QUALIFICATION_SHA"
+          test "$(git rev-parse HEAD^{tree})" = "$QUALIFICATION_TREE"
+          git rev-parse HEAD HEAD^{tree}
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
@@ -257,6 +352,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && env.QUALIFICATION_SHA || github.ref }}
+          persist-credentials: false
+      - name: Verify qualification source
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$QUALIFICATION_SHA"
+          test "$(git rev-parse HEAD^{tree})" = "$QUALIFICATION_TREE"
+          git rev-parse HEAD HEAD^{tree}
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
@@ -304,7 +409,15 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+          ref: ${{ github.event_name == 'workflow_dispatch' && env.QUALIFICATION_SHA || github.event.pull_request.base.sha }}
+      - name: Verify qualification source
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$QUALIFICATION_SHA"
+          test "$(git rev-parse HEAD^{tree})" = "$QUALIFICATION_TREE"
+          git rev-parse HEAD HEAD^{tree}
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
@@ -349,8 +462,17 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && env.QUALIFICATION_SHA || github.ref }}
+          persist-credentials: false
           # Need full history for git diff against base in patch_coverage.py.
           fetch-depth: 0
+      - name: Verify qualification source
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$QUALIFICATION_SHA"
+          test "$(git rev-parse HEAD^{tree})" = "$QUALIFICATION_TREE"
+          git rev-parse HEAD HEAD^{tree}
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: coverage-head
@@ -521,6 +643,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && env.QUALIFICATION_SHA || github.ref }}
+          persist-credentials: false
+      - name: Verify qualification source
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$QUALIFICATION_SHA"
+          test "$(git rev-parse HEAD^{tree})" = "$QUALIFICATION_TREE"
+          git rev-parse HEAD HEAD^{tree}
       - uses: taiki-e/install-action@b7d831ec1a6ef0d81d27cf61932d92140b2271d4 # cargo-audit
       # Ignore list + rationale: .cargo/audit.toml.
       - run: cargo audit --deny warnings
@@ -532,6 +664,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && env.QUALIFICATION_SHA || github.ref }}
+          persist-credentials: false
+      - name: Verify qualification source
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$QUALIFICATION_SHA"
+          test "$(git rev-parse HEAD^{tree})" = "$QUALIFICATION_TREE"
+          git rev-parse HEAD HEAD^{tree}
       - run: python3 .github/scripts/check_workflow_hardening.py
       - run: |
           mkdir -p /tmp/codex/kei/pycache
@@ -543,6 +685,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && env.QUALIFICATION_SHA || github.ref }}
+          persist-credentials: false
+      - name: Verify qualification source
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$QUALIFICATION_SHA"
+          test "$(git rev-parse HEAD^{tree})" = "$QUALIFICATION_TREE"
+          git rev-parse HEAD HEAD^{tree}
       - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
         with:
           version: 2026.8.10
@@ -577,6 +729,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && env.QUALIFICATION_SHA || github.ref }}
+          persist-credentials: false
+      - name: Verify qualification source
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$QUALIFICATION_SHA"
+          test "$(git rev-parse HEAD^{tree})" = "$QUALIFICATION_TREE"
+          git rev-parse HEAD HEAD^{tree}
       - uses: crate-ci/typos@5374cbf686e897b15713110e233094e2874de7ef # master
 
   # Single required check that gates merging. Skipped jobs (path-filtered
