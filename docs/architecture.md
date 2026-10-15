@@ -547,7 +547,11 @@ reseed. They cannot acknowledge omitted eligibility or old unresolved debt.
 Destination media completion requires an actual confined file fingerprint and
 independently verified selected source checksum. An exact active physical
 receipt can be reused across compatible passes after current selection and
-file verification; another path retains its own obligation. Imported generic
+file verification; another path retains its own obligation. Opaque provider
+signatures remain independent from source and local SHA-256. Fresh or legacy
+fallback publication requires a separately verified per-path source receipt;
+validated native reuse relies on its own lossless generation/destination receipt,
+including operation-owned prepared metadata output. Imported generic
 local checksums cannot establish source provenance. Metadata completion is
 separate and uses the existing option-aware rewrite owner with the exact native
 path, frozen grouping and writer flags. Disabled flags cannot finish older
@@ -1686,9 +1690,15 @@ counts. Provider error text, record identities, paths and URLs remain private.
 Activation requires a normal completed current inventory and, when a retained
 cursor exists, a successful delta bridge. Independently identified current
 children need separate, finalized receipts and verified files for every selected
-rendition. A file published before a state-write crash may qualify by exact
-SHA-256 equality with the current provider checksum; filename and size are not
-sufficient. Modified media needs its verified pre-metadata checksum. Pending
+rendition. Qualification requires independently verified per-path source
+provenance for the exact child, rendition, provider generation and catalogue
+path, with a freshly verified current local SHA-256. Provider MMCS signatures
+are generation identities and are never compared to local content hashes.
+Historical download hashes and publication without durable source provenance
+remain insufficient. A new unverified publication that changes local bytes
+clears prior source provenance; verified metadata rewrites retain their source
+receipt. Exact-byte relocation can reuse an unambiguous source receipt bound
+to the same library, child, rendition and provider generation. Pending
 rewrite, capture-repair or path-reconciliation debt keeps this conservative
 qualification blocked. Retained reconciliation destination choices are naming
 evidence, not pending work, and remain part of the dependency comparison. No metadata writer is enabled automatically. A replay

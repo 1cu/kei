@@ -2505,6 +2505,18 @@ async fn private_destination_reopen_finishes_native_sidecar_receipts() {
 }
 
 async fn destination_reopen_fixture(native: bool, metadata: bool, backlog: bool) {
+    Box::pin(destination_reopen_fixture_with_signature(
+        native, metadata, backlog, false,
+    ))
+    .await;
+}
+
+async fn destination_reopen_fixture_with_signature(
+    native: bool,
+    metadata: bool,
+    backlog: bool,
+    opaque_mmcs: bool,
+) {
     let (trace, _trace_guard) = crate::test_helpers::TracingCapture::install();
     use crate::download::pipeline::{StreamRuntime, stream_and_download_from_stream};
     use sha2::{Digest, Sha256};
@@ -2542,7 +2554,7 @@ async fn destination_reopen_fixture(native: bool, metadata: bool, backlog: bool)
     assert!(!metadata);
     {
         let mut current = f.session.records.lock().unwrap();
-        current[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":format!("{}/destination",server.uri()),"size":media.len(),"fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(media))});
+        current[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":format!("{}/destination",server.uri()),"size":media.len(),"fileChecksum":if opaque_mmcs {data_encoding::BASE64.encode(&[0x72;21])} else {data_encoding::BASE64.encode(&Sha256::digest(media))}});
     }
     f.capture(records("m", OLD, "historical"), "old").await;
     let passes = vec![destination_pass(&f, "A"), destination_pass(&f, "B")];
@@ -2877,6 +2889,26 @@ async fn private_metadata_recovery_fixture(
     native: bool,
     finalization_fault: MetadataStateFault,
 ) {
+    Box::pin(private_metadata_recovery_fixture_with_signature(
+        shared,
+        interrupted,
+        refresh,
+        native,
+        finalization_fault,
+        false,
+    ))
+    .await;
+}
+
+#[cfg(feature = "xmp")]
+async fn private_metadata_recovery_fixture_with_signature(
+    shared: bool,
+    interrupted: bool,
+    refresh: bool,
+    native: bool,
+    finalization_fault: MetadataStateFault,
+    opaque_mmcs: bool,
+) {
     let (trace, _trace_guard) = crate::test_helpers::TracingCapture::install();
     use sha2::{Digest, Sha256};
     use wiremock::matchers::{method, path};
@@ -2917,7 +2949,7 @@ async fn private_metadata_recovery_fixture(
     f.config.folder_structure_albums = Arc::from(if shared { "copies" } else { "{album}" });
     f.config.metadata.embed_xmp = shared;
     f.config.metadata.xmp_sidecar = !shared;
-    f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":format!("{}/metadata-history",server.uri()),"size":media.len(),"fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(media))});
+    f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":format!("{}/metadata-history",server.uri()),"size":media.len(),"fileChecksum":if opaque_mmcs {data_encoding::BASE64.encode(&[0x72;21])} else {data_encoding::BASE64.encode(&Sha256::digest(media))}});
     f.session.records.lock().unwrap()[0]["fields"]["filenameEnc"] =
         json!({"value": filename, "type": "STRING"});
     if native {
@@ -5976,3 +6008,41 @@ async fn private_prepared_native_source_drift_preserves_lossy_utf8_sibling_and_l
 
 #[cfg(target_os = "linux")]
 mod late_io;
+
+#[tokio::test]
+async fn private_destination_opaque_mmcs_proofs_survive_reopen() {
+    Box::pin(destination_reopen_fixture_with_signature(
+        false, false, false, true,
+    ))
+    .await;
+    // This root contains invalid UTF-8, which macOS filesystems reject.
+    #[cfg(target_os = "linux")]
+    Box::pin(destination_reopen_fixture_with_signature(
+        true, false, false, true,
+    ))
+    .await;
+}
+
+#[cfg(all(target_os = "linux", feature = "xmp"))]
+#[tokio::test]
+async fn private_destination_opaque_mmcs_metadata_proofs_survive_reopen() {
+    Box::pin(destination_reopen_fixture_with_signature(
+        true, true, false, true,
+    ))
+    .await;
+}
+
+#[cfg(all(target_os = "linux", feature = "xmp"))]
+#[tokio::test]
+async fn private_prepared_native_opaque_mmcs_receipt_survives_drift_without_touching_text_sibling()
+{
+    Box::pin(private_metadata_recovery_fixture_with_signature(
+        true,
+        false,
+        false,
+        true,
+        MetadataStateFault::AfterWriteAndSourceDrift,
+        true,
+    ))
+    .await;
+}
