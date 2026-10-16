@@ -23,7 +23,7 @@ pub(super) fn prepare_metadata_heif(
     temp_suffix: &str,
     expected_fingerprint: Option<crate::download::file::ExistingFileFingerprint>,
 ) -> Result<PreparedMetadataFile> {
-    let _admission = super::prepared::admit_heif_metadata()?;
+    let _admission = super::prepared::admit_heif_metadata();
 
     // CONTRACT: HEIF_EMBED_REWRITE_REQUIRES_STABLE_INPUT
     ensure_initialized();
@@ -1349,6 +1349,45 @@ mod streaming_failure_tests {
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         assert!(embed_temp_entries(directory.path(), ".meta-tmp").is_empty());
         // Failed validation releases admission for a successful retry.
+        drop(
+            prepare_metadata_heif(
+                &path,
+                &MetadataWrite {
+                    rating: Some(4),
+                    ..MetadataWrite::default()
+                },
+                ".meta-tmp",
+                None,
+            )
+            .unwrap(),
+        );
+        assert!(embed_temp_entries(directory.path(), ".meta-tmp").is_empty());
+    }
+    #[test]
+    fn panicked_preparation_releases_admission_and_owned_temporary_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("synthetic.heic");
+        let bytes = crate::download::heif::apple_multi_exif_heic(
+            &crate::test_helpers::minimal_tiff_with_source_gps(),
+        );
+        std::fs::write(&path, &bytes).unwrap();
+        AFTER_STREAM_WRITE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|_, _| panic!("injected preparation panic")));
+        });
+        let panicked = std::panic::catch_unwind(|| {
+            let _ = prepare_metadata_heif(
+                &path,
+                &MetadataWrite {
+                    rating: Some(4),
+                    ..MetadataWrite::default()
+                },
+                ".meta-tmp",
+                None,
+            );
+        });
+        assert!(panicked.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(embed_temp_entries(directory.path(), ".meta-tmp").is_empty());
         drop(
             prepare_metadata_heif(
                 &path,

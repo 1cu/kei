@@ -193,7 +193,7 @@ fn probe_exif_xmp_toolkit(path: &Path) -> Result<ExifProbe> {
 
 #[cfg(feature = "xmp")]
 fn probe_exif_heif(path: &Path) -> Result<ExifProbe> {
-    let _admission = super::prepared::admit_heif_metadata()?;
+    let _admission = super::prepared::admit_heif_metadata();
     let mut source = std::fs::File::open(path)?;
     let len = source.metadata()?.len();
     let layout = heif::FileLayout::read(&mut source, len)?;

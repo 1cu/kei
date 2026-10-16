@@ -1588,7 +1588,7 @@ Preparation streams unchanged source ranges to its exclusive temporary writer
 with 64 KiB buffers, including native capture repairs. Preservation validation
 compares file ranges with fixed buffers rather than retaining either file.
 Source fingerprints are checked before and after preparation, and guarded
-publication rechecks both source and output. Errors and dropped prepared work
+publication rechecks both source and output. Errors, panics, and dropped prepared work
 release admission and the existing temporary-file guard removes owned output.
 
 HEIF-family embedded XMP updates use the byte-preserving item-map writer and

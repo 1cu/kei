@@ -318,19 +318,22 @@ mod native_tests {
 static HEIF_METADATA_ADMISSION: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(feature = "xmp")]
-pub(super) fn admit_heif_metadata() -> anyhow::Result<HeifMetadataAdmission> {
+pub(super) fn admit_heif_metadata() -> HeifMetadataAdmission {
+    // This lock protects only admission, not shared parser state. A panicking
+    // writer drops its owned buffers/temp; poison must not disable future work.
     let guard = HEIF_METADATA_ADMISSION
         .lock()
-        .map_err(|_poison| anyhow::anyhow!("HEIF metadata admission was poisoned"))?;
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     #[cfg(test)]
     {
         let active = HEIF_ACTIVE.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         HEIF_PEAK.fetch_max(active, std::sync::atomic::Ordering::SeqCst);
     }
-    Ok(HeifMetadataAdmission { _guard: guard })
+    HeifMetadataAdmission { _guard: guard }
 }
 
 #[cfg(feature = "xmp")]
+#[must_use]
 pub(super) struct HeifMetadataAdmission {
     _guard: std::sync::MutexGuard<'static, ()>,
 }
@@ -425,7 +428,7 @@ mod heif_admission_tests {
             &crate::test_helpers::minimal_tiff_with_source_gps(),
         );
         std::fs::write(&source, bytes).unwrap();
-        let lane = admit_heif_metadata().unwrap();
+        let lane = admit_heif_metadata();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
         let worker_source = source.clone();
