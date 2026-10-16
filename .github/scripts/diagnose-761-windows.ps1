@@ -105,7 +105,7 @@ function Invoke-Comparison([string]$variant, [int]$round, [bool]$traced) {
     $label = "$mode-$round-$variant"
     $disk = Measure-DiskControl $label
     $clock = [Diagnostics.Stopwatch]::StartNew()
-    $p = Start-Process "$bins/$variant.exe" -ArgumentList @('full_sync_worker_budget', '--nocapture', "--test-threads=$threads") `
+    $p = Start-Process "$bins/$variant.exe" -ArgumentList @('full_sync_worker_budget', "--test-threads=$threads") `
         -PassThru -RedirectStandardOutput "$out/$label.stdout.log" -RedirectStandardError "$out/$label.stderr.log"
     $null = $p.Handle
     $samples = [Collections.Generic.List[object]]::new()
