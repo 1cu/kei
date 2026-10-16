@@ -1,4 +1,4 @@
-name: Issue 761 Windows context diagnosis
+name: Issue 761 Windows storage diagnosis
 on:
   push:
     branches: [diagnose/heif-windows-761]
@@ -28,7 +28,7 @@ jobs:
           Copy-Item .github/scripts/diagnose-761-context.py "$env:RUNNER_TEMP/diagnose-761-context.py"
       - name: Compare unchanged watchdogs on one runner
         shell: pwsh
-        run: '& "$env:RUNNER_TEMP/diagnose-761-windows.ps1" -DiagnosticMode context'
+        run: '& "$env:RUNNER_TEMP/diagnose-761-windows.ps1" -DiagnosticMode storage'
       - name: Preserve diagnostic evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

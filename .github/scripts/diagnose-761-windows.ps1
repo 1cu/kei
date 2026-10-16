@@ -1,4 +1,4 @@
-param([ValidateSet('filtered', 'context')][string]$DiagnosticMode = 'filtered')
+param([ValidateSet('filtered', 'context', 'storage')][string]$DiagnosticMode = 'filtered')
 $ErrorActionPreference = 'Stop'
 $root = $env:GITHUB_WORKSPACE
 $out = Join-Path $env:RUNNER_TEMP 'issue-761-evidence'
@@ -34,6 +34,7 @@ $variants = @(
     @{ name = 'accounting-off'; sha = '196da2c71e2b7fe18e1f3763d946f19b8791ead5' }
 )
 if ($DiagnosticMode -eq 'context') { $variants = @($variants[1], @{ name = 'inactive-fastpath'; sha = $variants[1].sha }) }
+if ($DiagnosticMode -eq 'storage') { $variants = @($variants[1]) }
 foreach ($v in $variants) {
     git checkout --detach $v.sha
     if ($LASTEXITCODE -ne 0) { throw 'checkout failed' }
@@ -41,7 +42,7 @@ foreach ($v in $variants) {
     $baseBlob = & git rev-parse 'a2081bfd:src/download/orchestration/full/tests.rs'
     $currentBlob = & git rev-parse 'HEAD:src/download/orchestration/full/tests.rs'
     if ($baseBlob -ne $currentBlob) { throw 'worker tests differ from base' }
-    if ($DiagnosticMode -eq 'filtered') {
+    if ($DiagnosticMode -in @('filtered', 'storage')) {
     # Same diagnostic-only bootstrap in every binary; preserve every watchdog/assertion.
     $testText = [IO.File]::ReadAllText($testFile)
     $pattern = '(async fn check_full_sync_worker_budget[^\{]+\{)'
@@ -82,7 +83,7 @@ foreach ($v in $variants) {
         Select-Object -Last 1
     if (!$artifact) { throw 'library test binary not found' }
     Copy-Item $artifact.executable "$bins/$($v.name).exe"
-    $filter = if ($DiagnosticMode -eq 'filtered') { @('full_sync_worker_budget') } else { @() }
+    $filter = if ($DiagnosticMode -in @('filtered', 'storage')) { @('full_sync_worker_budget') } else { @() }
     $catalog = @(& "$bins/$($v.name).exe" @filter --list | Where-Object { $_ -match ': test$' } | Sort-Object)
     $catalog | Set-Content "$out/catalog-$($v.name).txt"
     if (@($catalog | Where-Object { $_ -match 'full_sync_worker_budget' }).Count -ne 4) { throw 'expected exactly four worker-budget tests' }
@@ -122,8 +123,8 @@ function Invoke-Comparison([string]$variant, [int]$round, [bool]$traced, [string
     $env:KEI_761_DIAGNOSTIC_TRACING = if ($traced) { '1' } else { $null }
     $label = "$mode-$round-$variant"
     $trialTemp = $null
-    if ($DiagnosticMode -eq 'context') {
-        $mode = "context-$volume"
+    if ($DiagnosticMode -in @('context', 'storage')) {
+        $mode = "$DiagnosticMode-$volume"
         $label = "$mode-$round-$variant"
         if ($volume -eq 'D') {
             $trialTemp = Join-Path $env:RUNNER_TEMP ("kei761-" + [guid]::NewGuid().ToString('N'))
@@ -133,7 +134,7 @@ function Invoke-Comparison([string]$variant, [int]$round, [bool]$traced, [string
         }
     }
     $actualTemp = & "$bins/parallelism.exe" --temp
-    if ($DiagnosticMode -eq 'context' -and !$actualTemp.StartsWith("$volume`:", [StringComparison]::OrdinalIgnoreCase)) { throw 'child temp volume was not applied' }
+    if ($DiagnosticMode -in @('context', 'storage') -and !$actualTemp.StartsWith("$volume`:", [StringComparison]::OrdinalIgnoreCase)) { throw 'child temp volume was not applied' }
     $arguments = if ($DiagnosticMode -eq 'context') { $contextArgs + @("--test-threads=$threads") } else { @('full_sync_worker_budget', "--test-threads=$threads") }
     $disk = Measure-DiskControl $label
     $clock = [Diagnostics.Stopwatch]::StartNew()
@@ -173,8 +174,11 @@ function Invoke-Comparison([string]$variant, [int]$round, [bool]$traced, [string
         try { Remove-Item -LiteralPath $trialTemp -Recurse -Force } catch { Write-Warning "owned trial directory retained: $trialTemp" }
     }
 }
-# Filtered trials rotate variants; context trials retain natural tracing and pre-failure work.
-if ($DiagnosticMode -eq 'context') {
+# Storage trials isolate the actual worker batch; context retains preceding test history.
+if ($DiagnosticMode -eq 'storage') {
+    $order = @('C', 'D', 'D', 'C', 'D', 'C', 'C', 'D')
+    for ($round = 1; $round -le $order.Count; $round++) { Invoke-Comparison 'head' $round $true $order[$round - 1] }
+} elseif ($DiagnosticMode -eq 'context') {
     Invoke-Comparison 'head' 1 $false 'C'
     Invoke-Comparison 'inactive-fastpath' 2 $false 'C'
     Invoke-Comparison 'head' 3 $false 'D'
