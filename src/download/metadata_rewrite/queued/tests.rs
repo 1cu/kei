@@ -3263,16 +3263,25 @@ async fn run_pending_heif_metadata_limit_retains_debt_then_recovers_across_reope
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("bounded.heic");
     let db_path = dir.path().join("state.db");
-    // Generated sparse control box exceeds the production 8 MiB cap. No
-    // allocation or committed media fixture is proportional to its hole.
-    let prefix = crate::test_helpers::heif_ftyp_without_meta_bytes();
+    // A valid synthetic container has a sparse, selected native Exif item
+    // beyond the materialized TIFF-operation allowance. The large opaque
+    // tail is not a format error; this operation must retain resource debt.
+    let mut prefix = crate::download::heif::apple_multi_exif_heic(
+        &crate::test_helpers::minimal_tiff_with_source_gps(),
+    );
+    let item_len = 9_u32 * 1024 * 1024;
+    let item_start = u32::try_from(prefix.len() + 8).unwrap();
+    crate::download::heif::set_test_file_item_extent(&mut prefix, 6, item_start, item_len);
     let mut source = std::fs::File::create(&path).unwrap();
     source.write_all(&prefix).unwrap();
-    let meta_len = 9_u32 * 1024 * 1024;
-    source.write_all(&meta_len.to_be_bytes()).unwrap();
-    source.write_all(b"meta").unwrap();
+    source.write_all(&(item_len + 8).to_be_bytes()).unwrap();
+    source.write_all(b"mdat").unwrap();
+    source.write_all(&0u32.to_be_bytes()).unwrap();
     source
-        .set_len(prefix.len() as u64 + u64::from(meta_len))
+        .write_all(&crate::test_helpers::minimal_tiff_with_source_gps())
+        .unwrap();
+    source
+        .set_len(u64::from(item_start) + u64::from(item_len))
         .unwrap();
     drop(source);
     let error = crate::download::metadata::probe_exif(&path).unwrap_err();

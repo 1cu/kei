@@ -60,6 +60,10 @@ pub(super) fn prepare_metadata_heif(
         };
         apply_to_xmp(&mut meta, write)?;
         let xmp = meta.to_string().into_bytes();
+        // Neither the parsed source packet nor its toolkit graph is needed
+        // during streaming or independent output validation.
+        drop(meta);
+        drop(existing);
         let capture = if write.require_native_heif_capture_time {
             let (Some(datetime), Some(offset)) = (
                 write.datetime.as_deref(),
@@ -129,6 +133,7 @@ pub(super) fn prepare_metadata_heif(
                     tmp_path.display()
                 )
             })?;
+            drop(native_tiff);
             let native_probe = rewritten
                 .capture_time(&mut file)?
                 .ok_or_else(|| anyhow::anyhow!("Rewritten HEIC lost its native capture time"))?;

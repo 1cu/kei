@@ -222,7 +222,7 @@ fn probe_exif_heif(path: &Path) -> Result<ExifProbe> {
             };
         }
         Ok(None) => probe.native_heif_capture_time = HeifNativeCaptureTime::Missing,
-        Err(heif::HeifError::MetadataLimit) => return Err(heif::HeifError::MetadataLimit.into()),
+        Err(error @ heif::HeifError::MetadataLimit { .. }) => return Err(error.into()),
         Err(error) => {
             tracing::warn!(target: "kei::download::metadata", path = %path.display(), %error, "Failed to inspect native HEIF Exif capture time");
             mark_heif_exif_unreadable(&mut probe);
@@ -241,7 +241,7 @@ fn probe_exif_heif(path: &Path) -> Result<ExifProbe> {
             }
         },
         Ok(None) => {}
-        Err(heif::HeifError::MetadataLimit) => return Err(heif::HeifError::MetadataLimit.into()),
+        Err(error @ heif::HeifError::MetadataLimit { .. }) => return Err(error.into()),
         Err(error) => {
             tracing::warn!(target: "kei::download::metadata", path = %path.display(), %error, "Failed to resolve HEIF Exif item");
             mark_heif_exif_unreadable(&mut probe);
@@ -344,6 +344,17 @@ pub(super) fn probe_from_native_metadata(meta: &Metadata) -> ExifProbe {
 
 #[cfg(not(feature = "xmp"))]
 fn probe_exif_native(path: &Path) -> ExifProbe {
+    // Native-only builds do not embed HEIF metadata. Identify that unsupported
+    // format before the generic whole-file JPEG/TIFF reader can allocate it.
+    use std::io::Read;
+    let mut head = [0; 12];
+    let count = match std::fs::File::open(path).and_then(|mut file| file.read(&mut head)) {
+        Ok(count) => count,
+        Err(_) => return ExifProbe::default(),
+    };
+    if crate::download::file::is_heif_content(head.get(..count).unwrap_or(&[])) {
+        return ExifProbe::default();
+    }
     let Ok(input) = std::fs::read(path) else {
         return ExifProbe::default();
     };
@@ -536,5 +547,55 @@ mod native_tests {
             probe.datetime_original.as_deref(),
             Some("2024:06:15 10:00:00")
         );
+    }
+}
+
+#[cfg(all(test, not(feature = "xmp")))]
+mod native_heif_memory_tests {
+    #[test]
+    fn native_only_heif_probe_does_not_read_unsupported_media() {
+        use std::io::Write;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("synthetic.part");
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(b"\0\0\0\x10ftypheic\0\0\0\0").unwrap();
+        file.set_len(128 * 1024 * 1024).unwrap();
+        drop(file);
+        let (probe, heap) = crate::test_helpers::allocation::measure_heap_high_water(|| {
+            super::probe_exif(&path).unwrap()
+        });
+        assert!(probe.datetime_original.is_none());
+        assert!(heap.largest_allocation < 64 * 1024, "{heap:?}");
+        assert!(heap.peak_growth < 64 * 1024, "{heap:?}");
+        let (result, heap) = crate::test_helpers::allocation::measure_heap_high_water(|| {
+            super::super::native_writer::prepare_metadata_native(
+                &path,
+                &super::super::values::MetadataWrite {
+                    rating: Some(4),
+                    ..Default::default()
+                },
+                ".metadata-tmp",
+                None,
+            )
+        });
+        let error = result.err().expect("native HEIF remains unsupported");
+        assert!(error.to_string().contains("does not support embedded HEIF"));
+        assert!(heap.largest_allocation < 64 * 1024, "{heap:?}");
+        assert!(heap.peak_growth < 64 * 1024, "{heap:?}");
+        let stale = crate::download::file::ExistingFileFingerprint {
+            size: 0,
+            sha256: [0; 32],
+        };
+        let error = super::super::native_writer::prepare_metadata_native(
+            &path,
+            &Default::default(),
+            ".metadata-tmp",
+            Some(stale),
+        )
+        .err()
+        .expect("stale approval remains input-changed");
+        assert!(crate::download::file::classify_conditional_publish_error(&error).target_changed);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 128 * 1024 * 1024);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 }

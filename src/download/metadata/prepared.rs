@@ -350,7 +350,6 @@ impl Drop for HeifMetadataAdmission {
     }
 }
 
-#[cfg(feature = "xmp")]
 pub(super) fn fingerprint_open_file(
     file: &mut std::fs::File,
     path: &Path,

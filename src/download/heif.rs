@@ -80,8 +80,14 @@ pub(crate) use xmp_write::rewrite_xmp;
 /// while kei adds the byte offset / atom kind context.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum HeifError {
-    #[error("HEIF metadata exceeds the bounded rewrite limits")]
-    MetadataLimit,
+    #[error(
+        "HEIF metadata operation unsupported within resource allowance: {kind} requires {bytes} bytes; materialized-data allowance is {budget} bytes (not a format limit)"
+    )]
+    MetadataLimit {
+        kind: &'static str,
+        bytes: u64,
+        budget: usize,
+    },
     #[cfg(test)]
     #[error("Could not read HEIC metadata at byte {offset} of {total}: {source}")]
     Decode {
@@ -132,12 +138,13 @@ pub(crate) enum HeifError {
 pub(crate) fn classify_heif_metadata_limit(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<HeifError>()
-        .is_some_and(|error| matches!(error, HeifError::MetadataLimit))
+        .is_some_and(|error| matches!(error, HeifError::MetadataLimit { .. }))
 }
 
 #[derive(Debug)]
 pub(crate) enum HeifExifError {
     Io(std::io::Error),
+    ResourceUnsupported(HeifError),
     Malformed,
 }
 
@@ -172,7 +179,12 @@ mod tests {
     }
     #[test]
     fn classify_heif_metadata_limit_preserves_context_and_rejects_text_matches() {
-        let bounded = anyhow::Error::new(super::HeifError::MetadataLimit).context("probe context");
+        let bounded = anyhow::Error::new(super::HeifError::MetadataLimit {
+            kind: "test packet",
+            bytes: 9 * 1024 * 1024,
+            budget: 8 * 1024 * 1024,
+        })
+        .context("probe context");
         assert!(super::classify_heif_metadata_limit(&bounded));
         assert!(!super::classify_heif_metadata_limit(&anyhow::anyhow!(
             "HEIF metadata exceeds the bounded rewrite limits"

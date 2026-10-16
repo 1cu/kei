@@ -29,7 +29,6 @@ mod test_support;
 
 pub(super) use fingerprint::ExistingFileFingerprint;
 pub(crate) use fingerprint::compute_sha256;
-#[cfg(feature = "xmp")]
 pub(super) use fingerprint::fingerprint_open_file_snapshot_blocking;
 pub(crate) use fingerprint::imported_path_matches_receipt;
 pub(super) use fingerprint::{RetainedPendingFile, retain_pending_file};
@@ -59,6 +58,7 @@ pub(super) use transfer::DownloadOpts;
 pub(super) use transfer::download_file_with_mode;
 pub(super) use transfer::temp_download_path;
 pub(crate) use validation::LocalFileSizeExpectation;
+pub(crate) use validation::is_heif_content;
 pub(crate) use validation::local_file_size_matches_state;
 
 // These paths remain available even when current sibling callers infer their types.

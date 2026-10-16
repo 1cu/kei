@@ -8,10 +8,10 @@ use super::{ExifCaptureTime, HeifError, invalid_layout};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 
-// Match the existing writer's control-box ceiling. Media payloads have no
-// size ceiling: only metadata packets and control data are retained in RAM.
-pub(super) const MAX_METADATA_BYTES: usize = 8 * 1024 * 1024;
-const MAX_TOP_BOXES: usize = 65_536;
+// Reuse the existing writer's 8 MiB retained-control allowance, not a
+// format-size limit. Opaque meta children (including image-bearing idat)
+// remain file ranges and do not consume this allowance.
+pub(super) const MAX_RETAINED_DATA_BYTES: usize = 8 * 1024 * 1024;
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 
 pub(super) struct Patch {
@@ -20,22 +20,101 @@ pub(super) struct Patch {
 }
 
 pub(crate) struct FileLayout {
-    pub(super) meta: Vec<u8>,
+    // Compact parser view: synthetic meta/hdlr headers and only the four
+    // controls used by the existing item/relationship parsers.
+    pub(super) control_bytes: Vec<u8>,
     pub(super) meta_box: RawBox,
     pub(super) len: usize,
-    top: Vec<RawBox>,
+    controls: Vec<(RawBox, RawBox)>, // compact coordinates, original coordinates
+    children_start: usize,
+    insertion_safe: bool,
+}
+
+fn resource_limit(kind: &'static str, bytes: usize) -> HeifError {
+    HeifError::MetadataLimit {
+        kind,
+        bytes: bytes as u64,
+        budget: MAX_RETAINED_DATA_BYTES,
+    }
 }
 
 fn read_range<R: Read + Seek>(source: &mut R, range: Range<usize>) -> Result<Vec<u8>, HeifError> {
     let len = range
         .end
         .checked_sub(range.start)
-        .filter(|len| *len <= MAX_METADATA_BYTES)
-        .ok_or(HeifError::MetadataLimit)?;
+        .ok_or_else(|| invalid_layout("metadata range underflows"))?;
+    if len > MAX_RETAINED_DATA_BYTES {
+        return Err(resource_limit("retained control box", len));
+    }
     source.seek(SeekFrom::Start(range.start as u64))?;
     let mut bytes = vec![0; len];
     source.read_exact(&mut bytes)?;
     Ok(bytes)
+}
+
+fn read_box<R: Read + Seek>(
+    source: &mut R,
+    offset: usize,
+    end: usize,
+) -> Result<RawBox, HeifError> {
+    if end.saturating_sub(offset) < 8 {
+        return Err(invalid_layout("truncated ISO-BMFF box header"));
+    }
+    source.seek(SeekFrom::Start(offset as u64))?;
+    let mut header = [0u8; 16];
+    source.read_exact(
+        header
+            .get_mut(..8)
+            .ok_or_else(|| invalid_layout("box header"))?,
+    )?;
+    let size32 = u32::from_be_bytes(
+        header
+            .get(..4)
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| invalid_layout("box size"))?,
+    );
+    let kind = header
+        .get(4..8)
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| invalid_layout("box kind"))?;
+    let (header_size, size) = match size32 {
+        0 => {
+            return Err(invalid_layout(
+                "ISO-BMFF box has no explicit size and cannot be rewritten",
+            ));
+        }
+        1 => {
+            if end - offset < 16 {
+                return Err(invalid_layout("truncated large ISO-BMFF box header"));
+            }
+            source.read_exact(
+                header
+                    .get_mut(8..16)
+                    .ok_or_else(|| invalid_layout("box header"))?,
+            )?;
+            let size = u64::from_be_bytes(
+                header
+                    .get(8..16)
+                    .and_then(|b| b.try_into().ok())
+                    .ok_or_else(|| invalid_layout("box size"))?,
+            );
+            (
+                16,
+                usize::try_from(size).map_err(|_| invalid_layout("ISO-BMFF box is too large"))?,
+            )
+        }
+        size => (8, size as usize),
+    };
+    offset
+        .checked_add(size)
+        .filter(|box_end| size >= header_size && *box_end <= end)
+        .ok_or_else(|| invalid_layout("ISO-BMFF box extends past the file"))?;
+    Ok(RawBox {
+        start: offset,
+        size,
+        header_size,
+        kind,
+    })
 }
 
 impl FileLayout {
@@ -47,95 +126,84 @@ impl FileLayout {
         if !is_heif_content(&signature) {
             return Err(invalid_layout("input is not a HEIF-family file"));
         }
-        let mut top = Vec::new();
-        let mut offset = 0usize;
+        let mut offset = 0;
         let mut meta_box = None;
+        let mut insertion_safe = true;
         while offset < len {
-            if top.len() == MAX_TOP_BOXES {
-                return Err(HeifError::MetadataLimit);
-            }
-            let mut header = [0u8; 16];
-            if len - offset < 8 {
-                return Err(invalid_layout("truncated ISO-BMFF box header"));
-            }
-            source.seek(SeekFrom::Start(offset as u64))?;
-            source.read_exact(
-                header
-                    .get_mut(..8)
-                    .ok_or_else(|| invalid_layout("box header"))?,
-            )?;
-            let size32 = u32::from_be_bytes(
-                header
-                    .get(..4)
-                    .and_then(|b| b.try_into().ok())
-                    .ok_or_else(|| invalid_layout("box size"))?,
-            );
-            let kind = header
-                .get(4..8)
-                .and_then(|b| b.try_into().ok())
-                .ok_or_else(|| invalid_layout("box kind"))?;
-            let (header_size, size) = match size32 {
-                0 => {
-                    return Err(invalid_layout(
-                        "ISO-BMFF box has no explicit size and cannot be rewritten",
-                    ));
-                }
-                1 => {
-                    if len - offset < 16 {
-                        return Err(invalid_layout("truncated large ISO-BMFF box header"));
-                    }
-                    source.read_exact(
-                        header
-                            .get_mut(8..16)
-                            .ok_or_else(|| invalid_layout("box header"))?,
-                    )?;
-                    let size = u64::from_be_bytes(
-                        header
-                            .get(8..16)
-                            .and_then(|b| b.try_into().ok())
-                            .ok_or_else(|| invalid_layout("box size"))?,
-                    );
-                    (
-                        16,
-                        usize::try_from(size)
-                            .map_err(|_| invalid_layout("ISO-BMFF box is too large"))?,
-                    )
-                }
-                size => (8, size as usize),
-            };
-            let end = offset
-                .checked_add(size)
-                .filter(|end| size >= header_size && *end <= len)
-                .ok_or_else(|| invalid_layout("ISO-BMFF box extends past the file"))?;
-            let atom = RawBox {
-                start: offset,
-                size,
-                header_size,
-                kind,
-            };
-            if kind == *b"meta" && meta_box.replace(atom).is_some() {
+            let atom = read_box(source, offset, len)?;
+            insertion_safe &= matches!(&atom.kind, b"ftyp" | b"meta" | b"mdat" | b"free" | b"wide");
+            if atom.kind == *b"meta" && meta_box.replace(atom).is_some() {
                 return Err(invalid_layout("HEIC has multiple top-level meta boxes"));
             }
-            top.push(atom);
-            offset = end;
+            offset = atom.end();
         }
         let meta_box = meta_box.ok_or_else(|| invalid_layout("HEIC has no top-level meta box"))?;
-        let meta = read_range(source, meta_box.start..meta_box.end())?;
+        if meta_box.header_size != 8 {
+            return Err(invalid_layout("large-size meta boxes are unsupported"));
+        }
+        let mut prefix = [0; 12];
+        source.seek(SeekFrom::Start(meta_box.body_start() as u64))?;
+        source.read_exact(&mut prefix)?;
+        let prefix_size = if prefix.get(4..8) == Some(b"hdlr") {
+            0
+        } else if prefix.get(8..12) == Some(b"hdlr") {
+            4
+        } else {
+            return Err(invalid_layout("HEIC meta box has no handler box"));
+        };
+        let children_start = meta_box.body_start() + prefix_size;
+        let mut meta = vec![0; 8];
+        meta.get_mut(4..8)
+            .ok_or_else(|| invalid_layout("meta header"))?
+            .copy_from_slice(b"meta");
+        meta.extend_from_slice(
+            prefix
+                .get(..prefix_size)
+                .ok_or_else(|| invalid_layout("meta prefix"))?,
+        );
+        meta.extend_from_slice(&8u32.to_be_bytes());
+        meta.extend_from_slice(b"hdlr");
+        let mut controls: Vec<(RawBox, RawBox)> = Vec::new();
+        let mut offset = children_start;
+        while offset < meta_box.end() {
+            let original = read_box(source, offset, meta_box.end())?;
+            if matches!(&original.kind, b"pitm" | b"iinf" | b"iloc" | b"iref") {
+                if controls
+                    .iter()
+                    .any(|(_, previous)| previous.kind == original.kind)
+                {
+                    return Err(invalid_layout("HEIC has duplicate metadata control boxes"));
+                }
+                let retained = meta
+                    .len()
+                    .checked_add(original.size)
+                    .ok_or_else(|| invalid_layout("retained control size overflows"))?;
+                if retained > MAX_RETAINED_DATA_BYTES {
+                    return Err(resource_limit("retained rewrite controls", retained));
+                }
+                let compact = RawBox {
+                    start: meta.len(),
+                    ..original
+                };
+                meta.extend_from_slice(&read_range(source, original.start..original.end())?);
+                controls.push((compact, original));
+            }
+            offset = original.end();
+        }
+        super::boxes::patch_box_size(&mut meta)?;
         let _ = find_meta_layout(&meta)?;
         Ok(Self {
-            meta,
+            control_bytes: meta,
             meta_box,
             len,
-            top,
+            controls,
+            children_start,
+            insertion_safe,
         })
     }
 
     pub(super) fn ensure_insertion(&self) -> Result<(), HeifError> {
-        if self
-            .top
-            .iter()
-            .any(|atom| !matches!(&atom.kind, b"ftyp" | b"meta" | b"mdat" | b"free" | b"wide"))
-        {
+        if !self.insertion_safe {
             return Err(invalid_layout(
                 "HEIC insertion refuses top-level boxes with unhandled file offsets",
             ));
@@ -143,19 +211,55 @@ impl FileLayout {
         Ok(())
     }
 
-    pub(super) fn in_mdat(&self, start: usize, len: usize) -> bool {
-        start.checked_add(len).is_some_and(|end| {
-            self.top.iter().any(|atom| {
-                atom.kind == *b"mdat" && start >= atom.body_start() && end <= atom.end()
-            })
+    pub(super) fn in_mdat<R: Read + Seek>(
+        &self,
+        source: &mut R,
+        start: usize,
+        len: usize,
+    ) -> Result<bool, HeifError> {
+        let Some(end) = start.checked_add(len) else {
+            return Ok(false);
+        };
+        let mut offset = 0;
+        while offset < self.len {
+            let atom = read_box(source, offset, self.len)?;
+            if atom.kind == *b"mdat" && start >= atom.body_start() && end <= atom.end() {
+                return Ok(true);
+            }
+            offset = atom.end();
+        }
+        Ok(false)
+    }
+
+    pub(super) fn meta_patch(
+        &self,
+        range: Range<usize>,
+        bytes: Vec<u8>,
+    ) -> Result<Patch, HeifError> {
+        let (_, original) = self
+            .controls
+            .iter()
+            .find(|(compact, _)| compact.start == range.start && compact.end() == range.end)
+            .ok_or_else(|| invalid_layout("rewrite patch is not a complete metadata control"))?;
+        Ok(Patch {
+            range: original.start..original.end(),
+            bytes,
         })
     }
 
-    pub(super) fn meta_patch(&self, range: Range<usize>, bytes: Vec<u8>) -> Patch {
-        Patch {
-            range: self.meta_box.start + range.start..self.meta_box.start + range.end,
-            bytes,
+    fn next_opaque<R: Read + Seek>(
+        &self,
+        source: &mut R,
+        cursor: &mut usize,
+    ) -> Result<Option<RawBox>, HeifError> {
+        while *cursor < self.meta_box.end() {
+            let atom = read_box(source, *cursor, self.meta_box.end())?;
+            *cursor = atom.end();
+            if !matches!(&atom.kind, b"iinf" | b"iloc" | b"iref") {
+                return Ok(Some(atom));
+            }
         }
+        Ok(None)
     }
 
     pub(super) fn extents(&self, item: &IlocItem) -> Result<Vec<Range<usize>>, HeifError> {
@@ -182,9 +286,10 @@ impl FileLayout {
         &self,
         source: &mut R,
         item_id: u32,
+        kind: &'static str,
     ) -> Result<Vec<u8>, HeifError> {
-        let (_, _, iloc, _, _, _) = find_meta_layout(&self.meta)?;
-        let items = parse_iloc(&self.meta, iloc)?;
+        let (_, _, iloc, _, _, _) = find_meta_layout(&self.control_bytes)?;
+        let items = parse_iloc(&self.control_bytes, iloc)?;
         let item = items
             .items
             .iter()
@@ -198,11 +303,11 @@ impl FileLayout {
         let extents = self.extents(item)?;
         let len = extents
             .iter()
-            .try_fold(0usize, |len, extent| {
-                len.checked_add(extent.len())
-                    .filter(|len| *len <= MAX_METADATA_BYTES)
-            })
-            .ok_or(HeifError::MetadataLimit)?;
+            .try_fold(0usize, |len, extent| len.checked_add(extent.len()))
+            .ok_or_else(|| invalid_layout("metadata extent lengths overflow"))?;
+        if len > MAX_RETAINED_DATA_BYTES {
+            return Err(resource_limit(kind, len));
+        }
         let mut bytes = Vec::with_capacity(len);
         for extent in extents {
             source.seek(SeekFrom::Start(extent.start as u64))?;
@@ -218,18 +323,18 @@ impl FileLayout {
     }
 
     pub(crate) fn xmp<R: Read + Seek>(&self, source: &mut R) -> Result<Option<Vec<u8>>, HeifError> {
-        let (_, iinf, _, iref, primary, _) = find_meta_layout(&self.meta)?;
-        let info = parse_iinf(&self.meta, iinf)?;
-        select_xmp_item_id(&self.meta, iref, primary, &info.xmp_item_ids)?
-            .map(|id| self.item_payload(source, id))
+        let (_, iinf, _, iref, primary, _) = find_meta_layout(&self.control_bytes)?;
+        let info = parse_iinf(&self.control_bytes, iinf)?;
+        select_xmp_item_id(&self.control_bytes, iref, primary, &info.xmp_item_ids)?
+            .map(|id| self.item_payload(source, id, "selected XMP packet"))
             .transpose()
     }
 
     fn exif_item_id(&self) -> Result<Option<u32>, HeifError> {
-        let (_, iinf, _, iref, primary, _) = find_meta_layout(&self.meta)?;
-        let info = parse_iinf(&self.meta, iinf)?;
+        let (_, iinf, _, iref, primary, _) = find_meta_layout(&self.control_bytes)?;
+        let info = parse_iinf(&self.control_bytes, iinf)?;
         select_exif_item_id(
-            &self.meta,
+            &self.control_bytes,
             iref,
             primary,
             &info.exif_item_ids,
@@ -244,7 +349,11 @@ impl FileLayout {
         let Some(id) = self.exif_item_id()? else {
             return Ok(None);
         };
-        let mut payload = self.item_payload(source, id)?;
+        let mut payload = self.item_payload(
+            source,
+            id,
+            "native Exif item for TIFF parsing and alias validation",
+        )?;
         let offset = u32::from_be_bytes(
             payload
                 .get(..4)
@@ -276,12 +385,12 @@ impl FileLayout {
         offset: &str,
         subseconds: Option<&str>,
     ) -> Result<Patch, HeifError> {
-        super::relationships::validate_capture_repair_item_ownership(&self.meta)?;
+        super::relationships::validate_capture_repair_item_ownership(&self.control_bytes)?;
         let id = self
             .exif_item_id()?
             .ok_or_else(|| invalid_layout("HEIF file has no native Exif item"))?;
-        let (_, _, iloc, _, _, _) = find_meta_layout(&self.meta)?;
-        let items = parse_iloc(&self.meta, iloc)?;
+        let (_, _, iloc, _, _, _) = find_meta_layout(&self.control_bytes)?;
+        let items = parse_iloc(&self.control_bytes, iloc)?;
         if items.items.iter().any(|item| item.construction_method == 2) {
             return Err(invalid_layout(
                 "HEIF Exif repair cannot prove item-offset dependants remain unchanged",
@@ -300,7 +409,7 @@ impl FileLayout {
             })
             .ok_or_else(|| invalid_layout("HEIF Exif item cannot be safely updated in place"))?;
         if item_extent_is_shared(&items, id, range.start as u64, range.len() as u64)
-            || !self.in_mdat(range.start, range.len())
+            || !self.in_mdat(source, range.start, range.len())?
         {
             return Err(invalid_layout(
                 "HEIF Exif item does not own a writable mdat extent",
@@ -350,10 +459,10 @@ impl FileLayout {
         capture: Option<(&str, &str, Option<&str>)>,
         writer: &mut W,
     ) -> Result<(), HeifError> {
-        if xmp.len() > MAX_METADATA_BYTES {
-            return Err(HeifError::MetadataLimit);
+        if xmp.len() > MAX_RETAINED_DATA_BYTES {
+            return Err(resource_limit("replacement XMP packet", xmp.len()));
         }
-        let mut patches = super::xmp_write::plan_xmp(self, xmp)?;
+        let mut patches = super::xmp_write::plan_xmp(self, source, xmp)?;
         if let Some((datetime, offset, subseconds)) = capture {
             patches.push(self.capture_patch(source, datetime, offset, subseconds)?);
         }
@@ -368,15 +477,20 @@ impl FileLayout {
         rewritten: &mut S,
         capture: Option<(&str, &str, Option<&str>)>,
     ) -> Result<(), HeifError> {
-        let (_, iinf, iloc, iref, primary, _) = find_meta_layout(&self.meta)?;
-        let (_, out_iinf, out_iloc, out_iref, out_primary, _) = find_meta_layout(&output.meta)?;
-        let info = parse_iinf(&self.meta, iinf)?;
-        let out_info = parse_iinf(&output.meta, out_iinf)?;
-        let xmp = select_xmp_item_id(&self.meta, iref, primary, &info.xmp_item_ids)?;
-        let out_xmp =
-            select_xmp_item_id(&output.meta, out_iref, out_primary, &out_info.xmp_item_ids)?;
-        let items = parse_iloc(&self.meta, iloc)?;
-        let out_items = parse_iloc(&output.meta, out_iloc)?;
+        let (_, iinf, iloc, iref, primary, _) = find_meta_layout(&self.control_bytes)?;
+        let (_, out_iinf, out_iloc, out_iref, out_primary, _) =
+            find_meta_layout(&output.control_bytes)?;
+        let info = parse_iinf(&self.control_bytes, iinf)?;
+        let out_info = parse_iinf(&output.control_bytes, out_iinf)?;
+        let xmp = select_xmp_item_id(&self.control_bytes, iref, primary, &info.xmp_item_ids)?;
+        let out_xmp = select_xmp_item_id(
+            &output.control_bytes,
+            out_iref,
+            out_primary,
+            &out_info.xmp_item_ids,
+        )?;
+        let items = parse_iloc(&self.control_bytes, iloc)?;
+        let out_items = parse_iloc(&output.control_bytes, out_iloc)?;
         let protected =
             |item: &&IlocItem| item.construction_method == 0 && Some(item.item_id) != xmp;
         if items.items.iter().filter(protected).count()
@@ -422,26 +536,38 @@ impl FileLayout {
                 )?;
             }
         }
-        let opaque = |meta: &[u8]| -> Result<Vec<Range<usize>>, HeifError> {
-            let (atom, _, _, _, _, prefix) = find_meta_layout(meta)?;
-            Ok(
-                super::boxes::scan_raw_boxes(meta, atom.body_start() + prefix, atom.end())?
-                    .iter()
-                    .filter(|atom| !matches!(&atom.kind, b"iinf" | b"iloc" | b"iref"))
-                    .map(|atom| atom.start..atom.end())
-                    .collect(),
-            )
-        };
-        let before = opaque(&self.meta)?;
-        let after = opaque(&output.meta)?;
-        if before.len() != after.len()
-            || before.iter().zip(&after).any(|(before, after)| {
-                self.meta.get(before.clone()) != output.meta.get(after.clone())
-            })
-        {
-            return Err(invalid_layout(
-                "HEIC rewrite changed an opaque meta sub-box",
-            ));
+        compare_ranges(
+            source,
+            self.meta_box.body_start()..self.children_start,
+            rewritten,
+            output.meta_box.body_start()..output.children_start,
+            None,
+        )?;
+        let mut before_cursor = self.children_start;
+        let mut after_cursor = output.children_start;
+        loop {
+            match (
+                self.next_opaque(source, &mut before_cursor)?,
+                output.next_opaque(rewritten, &mut after_cursor)?,
+            ) {
+                (None, None) => break,
+                (Some(before), Some(after))
+                    if before.kind == after.kind && before.size == after.size =>
+                {
+                    compare_ranges(
+                        source,
+                        before.start..before.end(),
+                        rewritten,
+                        after.start..after.end(),
+                        None,
+                    )?;
+                }
+                _ => {
+                    return Err(invalid_layout(
+                        "HEIC rewrite changed an opaque meta sub-box",
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -520,7 +646,7 @@ fn compare_ranges<R: Read + Seek, S: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
-    use super::{FileLayout, MAX_METADATA_BYTES};
+    use super::{FileLayout, MAX_RETAINED_DATA_BYTES};
     use crate::download::heif::test_support::{MATRIX_XMP, atom};
     use std::io::{Cursor, Seek, SeekFrom, Write};
 
@@ -546,10 +672,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut file = std::fs::File::create(directory.path().join("oversized.heic")).unwrap();
         file.write_all(&atom(b"ftyp", b"heic\0\0\0\0")).unwrap();
-        file.write_all(&((MAX_METADATA_BYTES + 1) as u32).to_be_bytes())
+        file.write_all(&((MAX_RETAINED_DATA_BYTES + 1) as u32).to_be_bytes())
             .unwrap();
         file.write_all(b"meta").unwrap();
-        let len = 16 + MAX_METADATA_BYTES as u64 + 1;
+        let len = 16 + MAX_RETAINED_DATA_BYTES as u64 + 1;
         file.set_len(len).unwrap();
         drop(file);
         let mut file = std::fs::File::open(directory.path().join("oversized.heic")).unwrap();
@@ -576,7 +702,7 @@ mod tests {
         file.write_all(&free_size.to_be_bytes()).unwrap();
         file.seek(SeekFrom::Start(prefix.len() as u64 + free_size))
             .unwrap();
-        file.write_all(&layout.meta).unwrap();
+        file.write_all(&layout.control_bytes).unwrap();
         let len = file.stream_position().unwrap();
         drop(file);
         let mut file = std::fs::File::open(path).unwrap();
@@ -587,8 +713,11 @@ mod tests {
             parsed.meta_box.start as u64,
             prefix.len() as u64 + free_size
         );
-        assert_eq!(parsed.meta, layout.meta);
-        assert!(heap.largest_allocation < MAX_METADATA_BYTES, "{heap:?}");
+        assert_eq!(parsed.control_bytes, layout.control_bytes);
+        assert!(
+            heap.largest_allocation < MAX_RETAINED_DATA_BYTES,
+            "{heap:?}"
+        );
         // This input retains 32-bit iloc fields. Appending XMP beyond their
         // range fails before the first byte is written, rather than wrapping.
         let mut output = Vec::new();
@@ -619,8 +748,9 @@ mod tests {
                 None,
             )
             .unwrap();
-        let (_, _, iloc, _, _, _) = super::super::boxes::find_meta_layout(&after.meta).unwrap();
-        let items = super::super::items::parse_iloc(&after.meta, iloc).unwrap();
+        let (_, _, iloc, _, _, _) =
+            super::super::boxes::find_meta_layout(&after.control_bytes).unwrap();
+        let items = super::super::items::parse_iloc(&after.control_bytes, iloc).unwrap();
         let image = items.items.iter().find(|item| item.item_id == 2).unwrap();
         let range = after.extents(image).unwrap().remove(0);
         output[range.start] ^= 1;
@@ -635,20 +765,16 @@ mod tests {
                 .is_err()
         );
         output[range.start] ^= 1;
-        let mut changed_meta =
+        let (meta, _, _, _, _, prefix) = super::super::boxes::find_meta_layout(&output).unwrap();
+        let opaque =
+            super::super::boxes::scan_raw_boxes(&output, meta.body_start() + prefix, meta.end())
+                .unwrap()
+                .into_iter()
+                .find(|atom| atom.kind == *b"hdlr")
+                .unwrap();
+        output[opaque.body_start()] ^= 1;
+        let changed_meta =
             FileLayout::read(&mut Cursor::new(&output), output.len() as u64).unwrap();
-        let (meta, _, _, _, _, prefix) =
-            super::super::boxes::find_meta_layout(&changed_meta.meta).unwrap();
-        let opaque = super::super::boxes::scan_raw_boxes(
-            &changed_meta.meta,
-            meta.body_start() + prefix,
-            meta.end(),
-        )
-        .unwrap()
-        .into_iter()
-        .find(|atom| atom.kind == *b"hdlr")
-        .unwrap();
-        changed_meta.meta[opaque.body_start()] ^= 1;
         assert!(
             before
                 .validate(
@@ -709,7 +835,7 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("oversized.heic");
             let start = prefix.len() + 8;
-            let packet_len = MAX_METADATA_BYTES + 1;
+            let packet_len = MAX_RETAINED_DATA_BYTES + 1;
             set_test_file_item_extent(&mut prefix, item_id, start as u32, packet_len as u32);
             let mut file = std::fs::File::create(&path).unwrap();
             file.write_all(&prefix).unwrap();
@@ -727,11 +853,14 @@ mod tests {
                 } else {
                     layout.tiff(&mut file)
                 };
-                assert!(matches!(packet, Err(super::HeifError::MetadataLimit)));
+                assert!(matches!(
+                    packet,
+                    Err(super::HeifError::MetadataLimit { .. })
+                ));
                 let error = crate::download::metadata::probe_exif(&path).unwrap_err();
                 assert!(matches!(
                     error.downcast_ref::<super::HeifError>(),
-                    Some(super::HeifError::MetadataLimit)
+                    Some(super::HeifError::MetadataLimit { .. })
                 ));
             });
             assert!(heap.largest_allocation < 1024 * 1024, "{heap:?}");

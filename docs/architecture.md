@@ -1580,16 +1580,35 @@ An individual upsert guards the affected rendition and provider checksum without
 invalidating another rendition's prepared receipt.
 Failed receipt validation or state writes preserve checkpoint failure evidence.
 HEIF probes and embedded preparation share one process-wide blocking admission
-lane, independent of download concurrency. Control boxes and selected XMP/Exif
-packets are bounded to 8 MiB each, retaining the existing control-box ceiling;
-inputs with larger metadata or more than 65,536 top-level boxes fail closed
-and retain metadata retry work. Media payload size has no such ceiling.
-Preparation streams unchanged source ranges to its exclusive temporary writer
-with 64 KiB buffers, including native capture repairs. Preservation validation
-compares file ranges with fixed buffers rather than retaining either file.
+lane, independent of download concurrency. This conservative admission bounds
+simultaneous retained parser work; it is not needed for shared parser state and
+also serializes file I/O. Concurrency may be widened only with measured resource
+evidence.
+Production keeps a compact view of the `pitm`, `iinf`, `iloc`, and `iref` controls.
+Other `meta` children, including image-bearing `idat`, stay as file ranges.
+The separate file-backed source-GPS locator also budgets its required control
+tables rather than the complete `meta` body.
+Headers are scanned without a growing top-level or opaque-box inventory.
+Preparation patches changed controls and streams all unchanged ranges with
+64 KiB buffers; preservation checks compare original file ranges with fixed
+buffers. A large `meta` or `idat` payload alone is not a resource refusal.
+The retained-control view, selected XMP packet, complete native Exif item, and
+replacement XMP packet each have an 8 MiB materialization allowance. This reuses
+the prior writer's 8 MiB whole-`meta` allowance for the data still materialized;
+the selected Exif/XMP allowances are new operation restrictions, not format limits
+or a claim about all valid assets. Complete native TIFF parsing/alias validation
+and the XMP toolkit graph still require materialization. Larger operations return
+an explicit resource-unsupported error naming the required bytes and allowance,
+preserve the original, and retain truthful metadata retry work. The allowance is
+not a total-process RSS bound: C++ graphs, parsed structures, source/output control
+views, and fixed stack buffers also consume memory. Existing fixture sizes do not
+establish a representative camera/iCloud metadata distribution.
 Source fingerprints are checked before and after preparation, and guarded
-publication rechecks both source and output. Errors, panics, and dropped prepared work
-release admission and the existing temporary-file guard removes owned output.
+publication rechecks both source and output. Errors, panics, and dropped prepared
+work release admission and the existing temporary-file guard removes owned output.
+Native-only builds identify unsupported HEIF before the generic JPEG/TIFF probe
+or preparation can read the whole file; approved-input checks still use streaming
+fingerprints before preparation reports unsupported.
 
 HEIF-family embedded XMP updates use the byte-preserving item-map writer and
 reject layouts that cannot be changed without re-encoding unknown item-graph

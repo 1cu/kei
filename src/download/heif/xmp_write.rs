@@ -1,6 +1,6 @@
 //! Byte-preserving insertion and replacement of the selected XMP packet.
 
-use super::boxes::{RawBox, box_with_body, find_meta_layout, patch_box_size, scan_raw_boxes};
+use super::boxes::{RawBox, box_with_body, find_meta_layout};
 use super::items::{
     append_iinf_entry, append_iloc_entry, item_extent_is_shared, parse_iinf, parse_iloc,
     reject_meta_overlapping_items, rewrite_existing_iloc,
@@ -12,6 +12,7 @@ use super::stream::FileLayout;
 use super::{HeifError, invalid_layout};
 #[cfg(any(test, feature = "__fuzz_internals"))]
 use std::io::Write;
+use std::io::{Read, Seek};
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct XmpLocation {
@@ -105,7 +106,7 @@ pub(crate) fn rewrite_xmp<W: Write>(
 ) -> Result<(), HeifError> {
     let mut source = std::io::Cursor::new(input);
     let layout = FileLayout::read(&mut source, input.len() as u64)?;
-    let patches = plan_xmp(&layout, xmp)?;
+    let patches = plan_xmp(&layout, &mut source, xmp)?;
     layout.write(&mut source, &patches, &mut writer)
 }
 
@@ -114,14 +115,15 @@ pub(crate) fn rewrite_xmp<W: Write>(
     clippy::indexing_slicing,
     reason = "Ranges come from validated control boxes and checked extent arithmetic."
 )]
-pub(super) fn plan_xmp(
+pub(super) fn plan_xmp<R: Read + Seek>(
     layout: &FileLayout,
+    source: &mut R,
     xmp: &[u8],
 ) -> Result<Vec<super::stream::Patch>, HeifError> {
     use super::stream::Patch;
-    let input = layout.meta.as_slice();
+    let input = layout.control_bytes.as_slice();
     let file_len = layout.len;
-    let (meta, iinf, iloc, iref, primary_item_id, prefix_size) = find_meta_layout(input)?;
+    let (_, iinf, iloc, iref, primary_item_id, _) = find_meta_layout(input)?;
     let iloc_layout = parse_iloc(input, iloc)?;
     let (
         existing,
@@ -164,9 +166,9 @@ pub(super) fn plan_xmp(
             u64::try_from(location.extent_length)
                 .map_err(|_| invalid_layout("existing XMP length overflows"))?,
         );
-        let in_mdat = layout.in_mdat(location.extent_start, location.extent_length);
+        let in_mdat = layout.in_mdat(source, location.extent_start, location.extent_length)?;
         if xmp.len() <= location.extent_length
-            && location.extent_length <= super::stream::MAX_METADATA_BYTES
+            && location.extent_length <= super::stream::MAX_RETAINED_DATA_BYTES
             && !shared
             && in_mdat
         {
@@ -190,7 +192,7 @@ pub(super) fn plan_xmp(
             u64::try_from(xmp.len()).map_err(|_| invalid_layout("XMP packet is too large"))?,
         )?;
         return Ok(vec![
-            layout.meta_patch(iloc.start..iloc.end(), new_iloc),
+            layout.meta_patch(iloc.start..iloc.end(), new_iloc)?,
             Patch {
                 range: file_len..file_len,
                 bytes: box_with_body(*b"mdat", xmp)?,
@@ -232,7 +234,7 @@ pub(super) fn plan_xmp(
             0,
         ),
     };
-    let old_meta_len = meta.size;
+    let old_meta_len = layout.meta_box.size;
     let xmp_length =
         u64::try_from(xmp.len()).map_err(|_| invalid_layout("XMP packet is too large"))?;
     let placeholder_iloc = append_iloc_entry(
@@ -289,37 +291,33 @@ pub(super) fn plan_xmp(
         .and_then(|len| len.checked_add(new_iloc.len()))
         .and_then(|len| len.checked_sub(iloc.size))
         .ok_or_else(|| invalid_layout("new HEIC meta size overflows"))?;
-    let mut meta_bytes = Vec::with_capacity(new_meta_len);
-    meta_bytes.extend_from_slice(&input[meta.start..meta.body_start() + prefix_size]);
-    let children = scan_raw_boxes(input, meta.body_start() + prefix_size, meta.end())?;
-    for child in children {
-        if child.start == iinf.start {
-            meta_bytes.extend_from_slice(&new_iinf);
-            if iref.is_none() {
-                meta_bytes.extend_from_slice(&new_iref);
-            }
-        } else if iref.is_some_and(|existing| existing.start == child.start) {
-            meta_bytes.extend_from_slice(&new_iref);
-        } else if child.start == iloc.start {
-            meta_bytes.extend_from_slice(&new_iloc);
-        } else {
-            meta_bytes.extend_from_slice(&input[child.start..child.end()]);
+    let new_size = u32::try_from(new_meta_len)
+        .map_err(|_| invalid_layout("rewritten ISO-BMFF box is too large"))?;
+    let mut iinf_bytes = new_iinf;
+    let iref_patch = match iref {
+        Some(iref) => Some(layout.meta_patch(iref.start..iref.end(), new_iref)?),
+        None => {
+            iinf_bytes.extend_from_slice(&new_iref);
+            None
         }
-    }
-    patch_box_size(&mut meta_bytes)?;
-    if meta_bytes.len() != new_meta_len {
-        return Err(invalid_layout("rewritten HEIC meta size is inconsistent"));
-    }
-    Ok(vec![
+    };
+    let mut patches = vec![
         Patch {
-            range: layout.meta_box.start..layout.meta_box.end(),
-            bytes: meta_bytes,
+            range: layout.meta_box.start..layout.meta_box.start + 4,
+            bytes: new_size.to_be_bytes().to_vec(),
         },
+        layout.meta_patch(iinf.start..iinf.end(), iinf_bytes)?,
+        layout.meta_patch(iloc.start..iloc.end(), new_iloc)?,
         Patch {
             range: file_len..file_len,
             bytes: box_with_body(*b"mdat", xmp)?,
         },
-    ])
+    ];
+    if let Some(patch) = iref_patch {
+        patches.push(patch);
+    }
+    patches.sort_by_key(|patch| patch.range.start);
+    Ok(patches)
 }
 
 #[cfg(test)]
