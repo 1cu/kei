@@ -91,9 +91,9 @@ changing behavior.
 | HEIF layout | `src/download/heif/boxes.rs`, `src/download/heif/items.rs` | Owns box boundaries, item tables, extent resolution, and item-location encoding. |
 | HEIF metadata relationships | `src/download/heif/relationships.rs` | Resolves primary-image metadata ownership and encodes item references. Ambiguous ownership fails closed. |
 | HEIF native Exif | `src/download/heif/exif.rs` | Extracts native Exif and repairs capture timestamps, offsets, and paired subseconds within existing TIFF storage. Unsafe or insufficient storage leaves repair pending; native values are verified before publication. |
-| HEIF XMP | `src/download/heif/xmp_read.rs`, `src/download/heif/xmp_write.rs` | Reads, inserts, and replaces the selected XMP packet without re-encoding image payloads. |
+| HEIF XMP | `src/download/heif/stream.rs`, `src/download/heif/xmp_write.rs` | Reads the selected packet and plans bounded item-map replacements without re-encoding image payloads. The in-memory `xmp_read` remains a test and fuzz oracle. |
 | HEIF streaming | `src/download/heif/stream.rs` | Reads bounded control data and metadata packets, streams unchanged file ranges, and compares protected payloads with fixed buffers. |
-| HEIF preservation checks | `src/download/heif/preservation.rs` | Validates non-XMP item payloads and opaque metadata after a rewrite. |
+| HEIF preservation checks | `src/download/heif/stream.rs`, `src/download/heif/preservation.rs` | Streams production checks of non-XMP payloads and opaque metadata; the in-memory validator remains a test and fuzz oracle. |
 | Metadata rewrite facade and immediate execution | `src/download/metadata_rewrite.rs`, `src/download/metadata_rewrite/immediate.rs` | Preserves rewrite entry points and coordinates download-time metadata writes. The pipeline retains media publication and state finalization. |
 | Metadata write planning | `src/download/metadata_rewrite/planning.rs` | Owns opt-in flags and embedded field decisions shared by immediate and queued execution. |
 | Metadata write execution | `src/download/metadata_rewrite/embedded.rs`, `src/download/metadata_rewrite/sidecar.rs` | Coordinates fingerprint-guarded embedded writes and source-aware sidecar writes through the metadata owners. |
