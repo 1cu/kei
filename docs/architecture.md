@@ -92,6 +92,7 @@ changing behavior.
 | HEIF metadata relationships | `src/download/heif/relationships.rs` | Resolves primary-image metadata ownership and encodes item references. Ambiguous ownership fails closed. |
 | HEIF native Exif | `src/download/heif/exif.rs` | Extracts native Exif and repairs capture timestamps, offsets, and paired subseconds within existing TIFF storage. Unsafe or insufficient storage leaves repair pending; native values are verified before publication. |
 | HEIF XMP | `src/download/heif/xmp_read.rs`, `src/download/heif/xmp_write.rs` | Reads, inserts, and replaces the selected XMP packet without re-encoding image payloads. |
+| HEIF streaming | `src/download/heif/stream.rs` | Reads bounded control data and metadata packets, streams unchanged file ranges, and compares protected payloads with fixed buffers. |
 | HEIF preservation checks | `src/download/heif/preservation.rs` | Validates non-XMP item payloads and opaque metadata after a rewrite. |
 | Metadata rewrite facade and immediate execution | `src/download/metadata_rewrite.rs`, `src/download/metadata_rewrite/immediate.rs` | Preserves rewrite entry points and coordinates download-time metadata writes. The pipeline retains media publication and state finalization. |
 | Metadata write planning | `src/download/metadata_rewrite/planning.rs` | Owns opt-in flags and embedded field decisions shared by immediate and queued execution. |
@@ -1578,6 +1579,18 @@ each prepared capture-repair receipt against its own rendition's incoming hash.
 An individual upsert guards the affected rendition and provider checksum without
 invalidating another rendition's prepared receipt.
 Failed receipt validation or state writes preserve checkpoint failure evidence.
+HEIF probes and embedded preparation share one process-wide blocking admission
+lane, independent of download concurrency. Control boxes and selected XMP/Exif
+packets are bounded to 8 MiB each, retaining the existing control-box ceiling;
+inputs with larger metadata or more than 65,536 top-level boxes fail closed
+and retain metadata retry work. Media payload size has no such ceiling.
+Preparation streams unchanged source ranges to its exclusive temporary writer
+with 64 KiB buffers, including native capture repairs. Preservation validation
+compares file ranges with fixed buffers rather than retaining either file.
+Source fingerprints are checked before and after preparation, and guarded
+publication rechecks both source and output. Errors and dropped prepared work
+release admission and the existing temporary-file guard removes owned output.
+
 HEIF-family embedded XMP updates use the byte-preserving item-map writer and
 reject layouts that cannot be changed without re-encoding unknown item-graph
 data. A file may hold one XMP item per image, so probe and write both resolve

@@ -60,6 +60,10 @@ pub(super) async fn prepare_embed_metadata(
                 tracing::warn!(
                     target: "kei::download::metadata_rewrite",
                     path = %embed_path.display(), error = %e, "Failed to read EXIF");
+                #[cfg(feature = "xmp")]
+                if e.downcast_ref::<crate::download::heif::HeifError>().is_some_and(|error| matches!(error, crate::download::heif::HeifError::MetadataLimit)) {
+                    return EmbedPrepareResult::Failed;
+                }
                 crate::download::metadata::ExifProbe::default()
             }
         };

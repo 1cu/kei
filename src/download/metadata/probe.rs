@@ -170,7 +170,7 @@ pub(crate) fn probe_exif(path: &Path) -> Result<ExifProbe> {
 fn probe_exif_xmp(path: &Path) -> Result<ExifProbe> {
     ensure_initialized();
     if is_heif_file(path) {
-        Ok(probe_exif_heif(path))
+        probe_exif_heif(path)
     } else {
         probe_exif_xmp_toolkit(path)
     }
@@ -192,15 +192,12 @@ fn probe_exif_xmp_toolkit(path: &Path) -> Result<ExifProbe> {
 }
 
 #[cfg(feature = "xmp")]
-fn probe_exif_heif(path: &Path) -> ExifProbe {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::warn!(target: "kei::download::metadata", path = %path.display(), error = %e, "Failed to read HEIF for probe");
-            return ExifProbe::default();
-        }
-    };
-    let mut probe = match heif::extract_xmp_bytes(&bytes) {
+fn probe_exif_heif(path: &Path) -> Result<ExifProbe> {
+    let _admission = super::prepared::admit_heif_metadata()?;
+    let mut source = std::fs::File::open(path)?;
+    let len = source.metadata()?.len();
+    let layout = heif::FileLayout::read(&mut source, len)?;
+    let mut probe = match layout.xmp(&mut source)? {
         Some(xmp_bytes) => match std::str::from_utf8(&xmp_bytes) {
             Ok(text) => match text.parse::<XmpMeta>() {
                 Ok(meta) => probe_from_meta(&meta),
@@ -216,7 +213,7 @@ fn probe_exif_heif(path: &Path) -> ExifProbe {
         },
         None => ExifProbe::default(),
     };
-    match heif::extract_exif_capture_time(&bytes) {
+    match layout.capture_time(&mut source) {
         Ok(Some(capture_time)) => {
             probe.native_heif_capture_time = HeifNativeCaptureTime::Present {
                 datetime_original: capture_time.datetime_original,
@@ -225,13 +222,14 @@ fn probe_exif_heif(path: &Path) -> ExifProbe {
             };
         }
         Ok(None) => probe.native_heif_capture_time = HeifNativeCaptureTime::Missing,
+        Err(heif::HeifError::MetadataLimit) => return Err(heif::HeifError::MetadataLimit.into()),
         Err(error) => {
             tracing::warn!(target: "kei::download::metadata", path = %path.display(), %error, "Failed to inspect native HEIF Exif capture time");
             mark_heif_exif_unreadable(&mut probe);
-            return probe;
+            return Ok(probe);
         }
     }
-    match heif::extract_exif_tiff_bytes(&bytes) {
+    match layout.tiff(&mut source) {
         Ok(Some(tiff)) => match Metadata::new_from_vec(&tiff, FileExtension::TIFF) {
             Ok(metadata) => {
                 let exif_probe = probe_from_native_metadata(&metadata);
@@ -243,12 +241,13 @@ fn probe_exif_heif(path: &Path) -> ExifProbe {
             }
         },
         Ok(None) => {}
+        Err(heif::HeifError::MetadataLimit) => return Err(heif::HeifError::MetadataLimit.into()),
         Err(error) => {
             tracing::warn!(target: "kei::download::metadata", path = %path.display(), %error, "Failed to resolve HEIF Exif item");
             mark_heif_exif_unreadable(&mut probe);
         }
     }
-    probe
+    Ok(probe)
 }
 
 #[cfg(feature = "xmp")]

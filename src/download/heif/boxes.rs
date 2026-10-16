@@ -299,6 +299,7 @@ fn parse_primary_item_id(bytes: &[u8], pitm: RawBox) -> Result<u32, HeifError> {
     }
 }
 
+#[cfg(test)]
 pub(super) fn extent_is_within_mdat_payload(
     bytes: &[u8],
     extent_start: usize,
