@@ -43,6 +43,7 @@ mod test_writer;
 mod xmp_read;
 mod xmp_write;
 
+#[cfg(any(test, feature = "__fuzz_internals"))]
 use mp4_atom::FourCC;
 
 pub(crate) use boxes::{is_heif_content, is_heif_path};
@@ -96,6 +97,7 @@ pub(crate) enum HeifError {
     )]
     UnparsableTail { offset: u64, total: u64 },
 
+    #[cfg(any(test, feature = "__fuzz_internals"))]
     #[error("Could not read HEIC metadata box `{kind}`: {source}")]
     MetaSubBoxDecode {
         kind: FourCC,
