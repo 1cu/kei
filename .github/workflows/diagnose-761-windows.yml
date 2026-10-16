@@ -1,4 +1,4 @@
-name: Issue 761 Windows diagnosis
+name: Issue 761 Windows context diagnosis
 on:
   push:
     branches: [diagnose/heif-windows-761]
@@ -23,10 +23,12 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Prepare diagnostic script outside switched checkouts
         shell: pwsh
-        run: Copy-Item .github/scripts/diagnose-761-windows.ps1 "$env:RUNNER_TEMP/diagnose-761-windows.ps1"
+        run: |
+          Copy-Item .github/scripts/diagnose-761-windows.ps1 "$env:RUNNER_TEMP/diagnose-761-windows.ps1"
+          Copy-Item .github/scripts/diagnose-761-context.py "$env:RUNNER_TEMP/diagnose-761-context.py"
       - name: Compare unchanged watchdogs on one runner
         shell: pwsh
-        run: '& "$env:RUNNER_TEMP/diagnose-761-windows.ps1"'
+        run: '& "$env:RUNNER_TEMP/diagnose-761-windows.ps1" -DiagnosticMode context'
       - name: Preserve diagnostic evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
