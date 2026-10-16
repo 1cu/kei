@@ -1,0 +1,36 @@
+name: Issue 761 Windows diagnosis
+on:
+  push:
+    branches: [diagnose/heif-windows-761]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      RUSTFLAGS: -Dwarnings
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: 1.94.1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Prepare diagnostic script outside switched checkouts
+        shell: pwsh
+        run: Copy-Item .github/scripts/diagnose-761-windows.ps1 "$env:RUNNER_TEMP/diagnose-761-windows.ps1"
+      - name: Compare unchanged watchdogs on one runner
+        shell: pwsh
+        run: '& "$env:RUNNER_TEMP/diagnose-761-windows.ps1"'
+      - name: Preserve diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: issue-761-windows-diagnosis
+          path: ${{ runner.temp }}/issue-761-evidence
+          retention-days: 14
