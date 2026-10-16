@@ -3276,10 +3276,7 @@ async fn run_pending_heif_metadata_limit_retains_debt_then_recovers_across_reope
         .unwrap();
     drop(source);
     let error = crate::download::metadata::probe_exif(&path).unwrap_err();
-    assert!(matches!(
-        error.downcast_ref::<crate::download::heif::HeifError>(),
-        Some(crate::download::heif::HeifError::MetadataLimit)
-    ));
+    assert!(crate::download::heif::classify_heif_metadata_limit(&error));
     let original_checksum = crate::download::file::compute_sha256(&path).await.unwrap();
     let original_size = std::fs::metadata(&path).unwrap().len();
     let original_modified = std::fs::metadata(&path).unwrap().modified().unwrap();

@@ -125,6 +125,14 @@ pub(crate) enum HeifError {
     Io(#[from] std::io::Error),
 }
 
+/// Classify bounded metadata refusals through anyhow context at the owner boundary.
+#[must_use]
+pub(crate) fn classify_heif_metadata_limit(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<HeifError>()
+        .is_some_and(|error| matches!(error, HeifError::MetadataLimit))
+}
+
 #[derive(Debug)]
 pub(crate) enum HeifExifError {
     Io(std::io::Error),
@@ -159,5 +167,16 @@ mod tests {
         let io_err = std::io::Error::other("disk full");
         let err: HeifError = io_err.into();
         assert!(matches!(err, HeifError::Io(_)));
+    }
+    #[test]
+    fn classify_heif_metadata_limit_preserves_context_and_rejects_text_matches() {
+        let bounded = anyhow::Error::new(super::HeifError::MetadataLimit).context("probe context");
+        assert!(super::classify_heif_metadata_limit(&bounded));
+        assert!(!super::classify_heif_metadata_limit(&anyhow::anyhow!(
+            "HEIF metadata exceeds the bounded rewrite limits"
+        )));
+        assert!(!super::classify_heif_metadata_limit(&anyhow::Error::new(
+            super::invalid_layout("unsupported item map")
+        )));
     }
 }
