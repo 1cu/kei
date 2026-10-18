@@ -7,6 +7,27 @@ boundaries that protect user data.
 Use it as a starting map. Read the owning module and its direct callers before
 changing behavior.
 
+When statements overlap, the Owners table defines ownership, the Safety
+contract catalog defines required conditions, and source code wins over both.
+
+## Navigation
+
+This index lists the highest-traffic sections, not every heading. Link labels
+match their headings, so searching a label finds the section.
+
+- [Owners](#owners): find the decision owner and its boundary.
+- [Design rules](#design-rules) and [Wrong-layer traps](#wrong-layer-traps): check layer placement before editing.
+- [Command dispatch](#command-dispatch) and [Container startup](#container-startup): find entry points.
+- [Sync and provider checkpoints](#sync-and-provider-checkpoints) and [Full and incremental enumeration](#full-and-incremental-enumeration): trace source progress.
+- [Download and publication](#download-and-publication), [Durable pending retry](#durable-pending-retry), and [Import-existing](#import-existing): trace local work.
+- [Account ownership and legacy adoption](#account-ownership-and-legacy-adoption), [Transactional source catalog and replay](#transactional-source-catalog-and-replay), and [Current provider work admission](#current-provider-work-admission): trace durable source ownership.
+- [Selection generation shadow](#selection-generation-shadow), [Private selection and destination replay](#private-selection-and-destination-replay), and [Observed incremental shadow capture](#observed-incremental-shadow-capture): trace selection and destination projections.
+- [Data-safety invariants](#data-safety-invariants), [Safety contract catalog](#safety-contract-catalog), and [Secrets and diagnostics](#secrets-and-diagnostics): find the required safety conditions.
+- [Change-impact traversal](#change-impact-traversal) and [Change-impact checklist](#change-impact-checklist): find related owners and consumers before editing.
+- [Tests](#tests): find proof entry points and the test guide.
+- [Managed edited-primary layouts](#managed-edited-primary-layouts) and [Support evidence boundary](#support-evidence-boundary): trace specialized flows.
+- [Maintaining this guide](#maintaining-this-guide): update this file with the change.
+
 ## Design rules
 
 - User media and metadata must not be lost, corrupted, truncated, overwritten,
@@ -17,6 +38,22 @@ changing behavior.
 - Path rendering does not decide whether an asset should sync.
 - SQLite transitions and provider checkpoints must survive interruption.
 - Prefer the smallest complete implementation in the owning module.
+
+### Wrong-layer traps
+
+- `src/commands/service.rs` plans provider libraries and collection passes.
+  Platform service installation and execution belong in `src/service/`.
+- `src/selection.rs` parses selectors. Live collection lookup and pass planning
+  belong in `src/commands/service.rs`; path rendering cannot resolve them.
+- `src/sync_loop/precheck.rs` handles the database change pre-check. Zone
+  checkpoint decisions belong in `src/sync_cycle.rs`, not in the Photos adapter
+  or file-transfer code.
+- Facades such as `src/download/mod.rs`, `src/download/file.rs`, and
+  `src/state/db.rs` expose entry points. Read the child owner in the Owners
+  table before adding behavior or looking for its tests. `src/state/db.rs` also
+  owns connection lifecycle and blocking-pool dispatch; keep that work there.
+- Reports, health, metrics, and support diagnostics consume observations.
+  They do not supply provider completeness or checkpoint authority.
 
 ## Owners
 
@@ -77,6 +114,8 @@ changing behavior.
 | Confined local copies | `src/download/file/reconciliation.rs` | Retains verified files and parent-directory capabilities through local copy and state finalization. |
 | File platform primitives | `src/download/file/platform.rs` | Owns platform rename, exchange, hard-link, and directory durability operations. |
 | Linux replacement recovery | `src/download/file/replacement_recovery.rs` | Journals conditional replacement when atomic exchange is unsupported, and recovers interrupted publication without overwriting concurrent edits. |
+| Staging identity | `src/download/file/staging.rs` | Coordinates destination guards, versioned staging names, and cleanup leases so retries and collisions keep independent staging files. |
+| Managed layout file handover | `src/download/file/primary_layout.rs` | Snapshots layout fingerprints, copies verified members, publishes, recovers prepared links, and retires aliases for a confined managed layout. Transition policy stays in `src/download/orchestration/primary_layout.rs`. |
 | State finalization | `src/download/finalize.rs` | Persists downloaded or failed outcomes and retries deferred state writes. |
 | Sparse identity retries | `src/download/orchestration/delta/sparse_identity.rs`, `src/state/db/sparse_identity.rs` | Selects bounded source retries and persists generation-fenced evidence; the cycle owner retains checkpoint authority. |
 | Durable retry resolution | `src/download/retry.rs` | Revalidates pending provider identity and builds exact retry tasks. |
@@ -118,6 +157,9 @@ changing behavior.
 | Temporary-file ownership | `src/state/db/temp_files.rs` | Stores losslessly encoded paths and durable temporary-file ownership. Filesystem cleanup stays in download orchestration. |
 | Durable reconciliation | `src/state/db/reconciliation.rs` | Stores destination reservations and reads catalog evidence for reconciliation. |
 | Durable import adoption | `src/state/db/import.rs` | Atomically adopts imported files into state and reads imported records. Matching policy stays in the import command. |
+| Durable layout journals | `src/state/db/primary_layout.rs` | Stores preservation-backed layout bindings, operations, members, path claims, and immutable historical receipts. |
+| Prior publication recovery | `src/state/db/pending_publication.rs` | Recovers a rendition's unchanged prior current publication and retains conditional recovery evidence. |
+| Legacy preservation evidence | `src/state/db/legacy_preservation.rs` | Stores immutable legacy evidence and generation-fenced current-coverage receipts. It never assigns identity, writes files, or infers provider completion. |
 | State reports | `src/state/db/reports.rs` | Reads status, verification and manifest data, and records sync-run history. |
 | Import-existing | `src/commands/import.rs` | Matches existing files to expected iCloud paths and adopts verified files into state. |
 | Service integration | `src/service/` | Owns install, uninstall, status, service execution, and platform renderers. |
@@ -333,7 +375,9 @@ progress. Existing `CheckpointEvidence`, sparse and legacy generation proofs,
 recovery debt and filesystem guards retain checkpoint authority. Capturing a
 tombstone cannot authorize local media deletion. Existing download and metadata
 queues still consume the current stream. Capture alone cannot admit queue work;
-the bounded retained-source admission below is a separately validated owner.
+the bounded retained-source admission in
+[Current provider work admission](#current-provider-work-admission) is a
+separately validated owner.
 
 Capture covers only incremental pages observed by existing sync in selected
 scopes. Rank inventories, bootstrap, lookup and deletion-validation scans are
@@ -341,7 +385,9 @@ not represented as complete zone capture or historical completeness. Rank EOF
 plus a delta bridge is not an atomic snapshot or proof of absence. New future
 observations cannot retire old expired-epoch debt. Complete queue projection,
 capture-owned cursors, durable catalog selection and separate progress remain
-later stages; the bounded current-generation slice below does not complete them. Historical-version retention, unrecoverable-debt acknowledgment,
+later stages; the bounded current-generation slice in
+[Current provider work admission](#current-provider-work-admission) does not
+complete them. Historical-version retention, unrecoverable-debt acknowledgment,
 epoch recovery and compaction still require explicit policy and support proof.
 The additive migration preserves existing rows and uses the migration owner's
 savepoint. Re-entry validates the table columns, primary keys, replay key and
@@ -375,7 +421,9 @@ that target's identity or materialization. No tombstone authorizes local deletio
 Receipt version 1 means source facts were indexed, including unresolved evidence;
 it does not mean selected, downloaded, rewritten, verified, historically complete
 or acknowledged recovery debt. Existing queues also accept the bounded current
-work admission described below; source indexing alone cannot authorize it.
+work admission in
+[Current provider work admission](#current-provider-work-admission); source
+indexing alone cannot authorize it.
 
 Derived page facts have a 16 MiB logical charge limit and a separate 512 MiB
 catalog index budget. These are operational backpressure limits, not physical
@@ -1542,7 +1590,8 @@ retry planning requires the durable reconcile truncation marker, confirms the
 recorded file is still truncated, and fingerprints its bytes. After the new
 download and configured metadata writes pass, the file owner replaces only
 that exact fingerprint. It uses atomic exchange where supported and the
-journaled Linux fallback described below otherwise. A changed
+journaled fallback owned by `src/download/file/replacement_recovery.rs`
+otherwise. A changed
 target is restored or retained and the state row stays failed. All other
 downloads keep no-overwrite publication.
 
@@ -2068,7 +2117,41 @@ Stable IDs connect safety rules to production owners and focused tests.
 | `XMP_GPS_ACCURACY_REQUIRES_MATCHING_LOCATION` | `src/download/metadata.rs`, `src/download/metadata_rewrite.rs`, `src/state/db.rs` | Native horizontal accuracy requires valid native latitude and longitude equal to the exported provider coordinates, plus a matching verified-download source checksum. Recovered local or download checksums cannot establish native provenance. Readable missing, invalid, or mismatched evidence omits accuracy and clears only obsolete kei-owned values. Source I/O failure preserves unknown fields and durable retry evidence. |
 | `METADATA_CAPTURE_REVISION_REPAIR_IS_DURABLE` | `src/download/orchestration/maintenance.rs`, `src/state/db.rs` | Revision repair updates catalogue metadata and configured rewrite evidence before promotion, stays library-scoped, and preserves the provider checkpoint on unresolved work. |
 
+## Change-impact traversal
+
+Use these search anchors after finding the owner. The related owners are an
+impact set, not a claim that every run calls each one in sequence. Read direct
+callers and follow shared values through their consumers. Each row names the
+flow section that owns its behavior and safety details; this table is not a
+second call graph.
+
+This table covers the highest-traffic changes only. Use the Owners table to
+find the owning module, then this table to find related consumers. Use the
+Change-impact checklist to choose verification.
+
+| Change | Search anchors and related owners | Flow or invariant |
+|--------|-----------------------------------|-------------------|
+| Collection selection | `Selection` in `src/selection.rs`; `collection_libraries`, `pass_scope_for_zone`, and `resolve_passes_for_scope` in `src/commands/service.rs`; sync callers in `src/sync_loop/planning.rs` and import callers in `src/commands/import.rs` | [Sync and provider checkpoints](#sync-and-provider-checkpoints), [Import-existing](#import-existing) |
+| Provider progress | `check_changes_database` and `store_scoped_db_sync_token` in `src/sync_loop/precheck.rs`; cycle calls in `src/sync_loop/runner.rs`; `source_checkpoint_decision` in `src/sync_cycle.rs`; `commit_checkpoint_transition` in `src/state/db/checkpoints.rs` | [Checkpoint advancement](#checkpoint-advancement), [Sync and provider checkpoints](#sync-and-provider-checkpoints) |
+| Enumeration proof | `download_photos_with_sync` in `src/download/orchestration/dispatch.rs`; full owner in `src/download/orchestration/full.rs`; incremental owner in `src/download/orchestration/incremental.rs`; `src/icloud/photos/album/enumeration.rs`, `src/icloud/photos/album/completion.rs`, and `src/icloud/photos/album/changes.rs` | [Full and incremental enumeration](#full-and-incremental-enumeration) |
+| File landing and state | `TaskPlanner` in `src/download/planner.rs`; `src/download/pipeline/producer.rs`, `consumer.rs`, `task.rs`, and `pass.rs`; `download_file_with_mode` in `src/download/file/transfer.rs`; `publish_part_to_final` in `src/download/file/publication.rs`; `finalize_downloaded_with_proof` in `src/download/finalize.rs`; `mark_downloaded` in `src/state/db/assets.rs` | [File landing](#file-landing), [Managed edited-primary layouts](#managed-edited-primary-layouts) |
+| Durable retry | `src/download/orchestration/recovery.rs`; `build_pending_retry_download_tasks` in `src/download/retry.rs`; targeted lookup in `src/icloud/photos/album/lookup.rs`; `DownloadStateStore` pending-state methods in `src/state/db/contracts.rs` | [Durable pending retry](#durable-pending-retry) |
+| Paths and import parity | `src/config/templates.rs`; `DownloadConfig::with_pass` in `src/download/orchestration/config.rs`; `src/download/paths.rs`; `expected_paths_for` in `src/download/filter/expected_paths.rs`; callers in `src/commands/import.rs`; local reconciliation in `src/download/orchestration/reconciliation.rs` | [Import-existing](#import-existing), [File landing](#file-landing) |
+| Metadata refresh and writes | `Config::runtime.refresh_metadata` reads in `src/sync_loop/runner.rs` and `src/sync_cycle.rs`; capture repair in `src/download/orchestration/maintenance.rs`; immediate and queued owners in `src/download/metadata_rewrite/`; format and publication owners in `src/download/metadata/` | [Metadata](#metadata) |
+| Import adoption | `run_import_existing`, `import_assets`, and `StrictImportVerifier` in `src/commands/import.rs`; `ImportStateStore::import_adopt` and its SQLite implementation in `src/state/db/import.rs` | [Import-existing](#import-existing), [State and serialization](#state-and-serialization) |
+| Service execution | dispatch in `src/lib.rs`; install, status, uninstall, and platform owners in `src/service/`; `src/service/run.rs` enters `src/sync_loop.rs::run_sync` | [Command dispatch](#command-dispatch), [Container startup](#container-startup) |
+
+For schema, durable-key, sentinel, serialization, and shared-type changes,
+follow [State and serialization](#state-and-serialization). Use
+[the test guide](../tests/README.md) to choose focused proof; a diagnostic count
+or a source-only assertion does not replace production-path state-transition
+proof.
+
 ## Change-impact checklist
+
+This table chooses verification for a change. It assumes the owner is already
+known; use [Change-impact traversal](#change-impact-traversal) to find the code
+to read first.
 
 | Change | Check |
 |--------|-------|
@@ -2138,9 +2221,13 @@ Update this file in the same pull request when a change:
 - Changes provider checkpoint or retry evidence
 - Changes schema, durable keys, or serialization
 - Changes the best test for an invariant
+- Adds, renames, or moves a major section, or changes its link label
+- Changes a traversal anchor, owner module, or flow link
 
 Keep the guide focused on stable ownership and safety. Source code remains the
-final authority.
+final authority. Do not cite build output, local session files, retained
+investigation notes, or release history as an ownership claim. Describe the
+current owner instead.
 
 ## Managed edited-primary layouts
 
