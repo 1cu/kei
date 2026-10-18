@@ -1669,3 +1669,16 @@ state changes are involved.
 The fixtures use no sleeps, retries, live credentials or provider requests.
 They demonstrate fork inheritance; they do not attribute the original parallel
 gate failure, whose conflicting descriptor was not captured.
+
+### Missing-reference inventory command
+
+`cargo test --all-features --lib diagnostic` and
+`cargo test --all-features --test cli missing_reference_inventory` exercise the
+cached-only early command path and restricted transport with synthetic auth and
+loopback provider fixtures. They cover all-EOF census/omissions, original auth and
+catalogue/media canaries, expired/future/malformed cache, endpoint qualification,
+HTTP authentication refusal, redirects, cancellation and shared raw-body/request
+budgets. Existing preservation and missing-reference lookup tests retain the
+ordinary fail-closed acceptance controls. No live account is used. Hard process
+supervision remains an external operational requirement, as documented in
+`docs/missing-reference-inventory.md`.

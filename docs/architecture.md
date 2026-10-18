@@ -2200,3 +2200,18 @@ History and export schema version 1 are separate from report version 3 and state
 schema 35. Raw reports and databases are never packaged. Interrupted writes
 preserve the previous history; read errors and limits appear as partial evidence.
 See [the operator guide](support-export.md) for limits and unavailable evidence.
+
+### Explicit missing-reference inventory diagnostic
+
+The opt-in `doctor --live --json --missing-reference-inventory` command branches
+before normal startup, logging, service hooks and ordinary doctor filesystem
+checks. `inventory_diagnostic.rs` reads bounded configuration and copied cached
+auth only. It does not open a catalogue or construct a download/state owner.
+`photos/diagnostic.rs` adapts the existing PhotosSession interface to privacy-safe
+streamed requests with shared limits and no redirect/retry/auth fallback.
+The existing PhotosService qualifies the private PrimarySync scope before the
+preservation scanner's raw latest-record helper supplies fixed missing-reference
+observations. The diagnostic performs no family hydration and returns no cursor
+or CompleteLegacyInventory proof. At most one later lookup is observational.
+Ordinary preservation retains its candidate, scope, date and completeness gates.
+See `docs/missing-reference-inventory.md` for bounds and supervision requirements.

@@ -53,7 +53,7 @@ enum LinkageShape {
     AllFields,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize)]
 pub(super) struct Observation {
     history: RecordHistory,
     prior_reference: ReferenceShape,
@@ -150,11 +150,11 @@ fn scope(zone: Option<&Value>, expected: &Value) -> &'static str {
 }
 
 #[derive(Debug)]
-struct LookupObservation {
-    outcome: &'static str,
-    family: &'static str,
-    scope: &'static str,
-    shape: &'static str,
+pub(super) struct LookupObservation {
+    pub(super) outcome: &'static str,
+    pub(super) family: &'static str,
+    pub(super) scope: &'static str,
+    pub(super) shape: &'static str,
 }
 
 impl LookupObservation {
@@ -278,14 +278,33 @@ impl PhotoAlbum {
         masters: &FxHashSet<String>,
         cancel: &CancellationToken,
     ) {
+        let lookup = self
+            .lookup_missing_reference(&record.record_name, masters, cancel)
+            .await;
+        crate::support::observe(
+            "support_missing_reference_v1",
+            json!({
+                "record_history":observation.history, "prior_reference":observation.prior_reference,
+                "sparse_marker":observation.sparse_marker, "linkage":observation.linkage,
+                "lookup_outcome":lookup.outcome, "lookup_family":lookup.family,
+                "lookup_scope":lookup.scope, "lookup_shape":lookup.shape,
+            }),
+        );
+    }
+    pub(super) async fn lookup_missing_reference(
+        &self,
+        child: &str,
+        masters: &FxHashSet<String>,
+        cancel: &CancellationToken,
+    ) -> LookupObservation {
         let url = format!(
             "{}/records/lookup?{}",
             self.service_endpoint,
             encode_params(&self.params)
         );
-        let body = json!({"zoneID":self.zone_id.as_ref(), "records":[{"recordName":record.record_name}],
+        let body = json!({"zoneID":self.zone_id.as_ref(), "records":[{"recordName":child}],
             "desiredKeys":["masterRef","isDeleted","isSparsePrivateRecord","linkedShareRecordName","linkedShareZoneName","linkedShareZoneOwner"]}).to_string();
-        let lookup = tokio::select! {
+        tokio::select! {
             biased;
             () = cancel.cancelled() => LookupObservation::unavailable("cancelled"),
             response = tokio::time::timeout(LOOKUP_TIMEOUT, self.session.post_diagnostic(&url, body, &[("Content-type", "text/plain")])) => match response {
@@ -297,18 +316,9 @@ impl PhotoAlbum {
                     DiagnosticLookupError::TooLarge => "oversized_response",
                     DiagnosticLookupError::Malformed => "malformed_response",
                 }),
-                Ok(Ok(value)) => classify(&value, &record.record_name, &self.zone_id, masters),
+                Ok(Ok(value)) => classify(&value, child, &self.zone_id, masters),
             },
-        };
-        crate::support::observe(
-            "support_missing_reference_v1",
-            json!({
-                "record_history":observation.history, "prior_reference":observation.prior_reference,
-                "sparse_marker":observation.sparse_marker, "linkage":observation.linkage,
-                "lookup_outcome":lookup.outcome, "lookup_family":lookup.family,
-                "lookup_scope":lookup.scope, "lookup_shape":lookup.shape,
-            }),
-        );
+        }
     }
 }
 

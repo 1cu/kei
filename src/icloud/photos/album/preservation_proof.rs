@@ -24,6 +24,11 @@ pub(crate) struct CompleteLegacyInventory {
     pub(crate) children: Vec<PhotoAsset>,
 }
 
+struct RetainedLegacyInventory {
+    cursor: String,
+    latest: FxHashMap<String, (Record, usize, Observation)>,
+}
+
 #[derive(Clone, Copy)]
 struct InventoryBudget {
     pages: usize,
@@ -186,6 +191,79 @@ fn compact_record(record: &mut Record, masters: &FxHashSet<String>) {
 }
 
 impl PhotoAlbum {
+    /// Observation only: no catalogue, family hydration or usable checkpoint proof.
+    pub(crate) async fn missing_reference_inventory(&self, cancel: &CancellationToken) -> Value {
+        let mut progress = LegacyInventoryDiagnostic::default();
+        let masters = FxHashSet::default();
+        let result = self
+            .scan_legacy_preservation_records(
+                &masters,
+                cancel,
+                InventoryBudget {
+                    pages: 1000,
+                    records: 200_000,
+                    retained_bytes: 256 * 1024 * 1024,
+                    page_bytes: 64 * 1024 * 1024,
+                },
+                &mut progress,
+            )
+            .await;
+        let counts = serde_json::json!({"pages":progress.pages,"records":progress.records,"retained_bytes":progress.retained_bytes});
+        let inventory = match result {
+            Ok(inventory) => inventory,
+            Err(error) => {
+                return serde_json::json!({"scan":"incomplete","counts":counts,
+                "reason":classify_legacy_inventory_error(&error).map_or("invalid_inventory", |d| d.subreason)});
+            }
+        };
+        let mut groups = std::collections::BTreeMap::<String, usize>::new();
+        let mut missing = 0usize;
+        let mut selected: Option<&Record> = None;
+        for (record, _, observation) in inventory.latest.values() {
+            if cancel.is_cancelled() {
+                return serde_json::json!({"scan":"incomplete","reason":"cancelled","counts":counts});
+            }
+            if record.record_type != "CPLAsset"
+                || record.deleted == Some(true)
+                || record.fields.pointer("/masterRef/value").is_some()
+            {
+                continue;
+            }
+            missing += 1;
+            if selected.is_none_or(|prior| record.record_name < prior.record_name) {
+                selected = Some(record);
+            }
+            let deletion = match record.fields.get("isDeleted") {
+                None => "absent",
+                Some(field) => match field.get("value").and_then(Value::as_i64) {
+                    Some(0) => "false",
+                    Some(1) => "true",
+                    _ => "malformed",
+                },
+            };
+            let shape = serde_json::json!({"observation":observation,"soft_deletion":deletion});
+            *groups.entry(shape.to_string()).or_default() += 1;
+        }
+        let omitted_groups = groups.len().saturating_sub(32);
+        let omitted_observations: usize = groups.values().skip(32).sum();
+        let groups: Vec<Value> = groups.into_iter().take(32).map(|(shape,count)| {
+            serde_json::json!({"shape":serde_json::from_str::<Value>(&shape).unwrap_or(Value::Null),"count":count})
+        }).collect();
+        let lookup = match selected {
+            Some(record) => {
+                let result = self
+                    .lookup_missing_reference(&record.record_name, &masters, cancel)
+                    .await;
+                serde_json::json!({"selection":"one_lexicographically_first_identity","selected_identities":1,
+                    "outcome":result.outcome,"scope":result.scope,"shape":result.shape})
+            }
+            None => serde_json::json!({"selected_identities":0,"outcome":"not_needed"}),
+        };
+        serde_json::json!({"scan":"eof_observed","purpose":"observation_only","counts":counts,
+            "missing_references":missing,"shown_groups":groups.len(),"omitted_groups":omitted_groups,
+            "omitted_observations":omitted_observations,"groups":groups,"lookup":lookup})
+    }
+
     /// Bounded, unfiltered zone inventory. Budget exhaustion retains the old hold.
     /// This is separate from display/filter enumeration and never commits a token.
     pub(crate) async fn complete_legacy_inventory(
@@ -266,6 +344,150 @@ impl PhotoAlbum {
             !masters.is_empty(),
             InventoryFailureKind::Evidence("missing_candidate_scope")
         );
+        let RetainedLegacyInventory { cursor, latest } = self
+            .scan_legacy_preservation_records(masters, cancel, budget, progress)
+            .await?;
+        let mut expected = FxHashSet::default();
+        for (record, _, observation) in latest.values().filter(|(record, _, _)| {
+            record.record_type == "CPLAsset" && record.deleted != Some(true)
+        }) {
+            progress.phase = "child_reference";
+            // A later sparse child must not inherit a previous child's scope.
+            progress.scope_mismatch_component = "not_applicable";
+            progress.supplied_owner = "not_recorded";
+            progress.supplied_owner_type = "not_recorded";
+            progress.family_context = "unknown";
+            progress.child_soft_deleted = record
+                .fields
+                .get("isDeleted")
+                .and_then(|field| field.get("value"))
+                .and_then(Value::as_i64)
+                == Some(1);
+            let Some(reference) = record
+                .fields
+                .get("masterRef")
+                .and_then(|field| field.get("value"))
+            else {
+                self.observe_missing_reference(record, *observation, masters, cancel)
+                    .await;
+                anyhow::bail!(InventoryFailureKind::Evidence(
+                    "child_master_reference_missing"
+                ));
+            };
+            let master = reference
+                .get("recordName")
+                .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+                .context(InventoryFailureKind::Evidence(
+                    "child_master_identity_invalid",
+                ))?;
+            progress.family_context = if masters.contains(master) {
+                "candidate"
+            } else {
+                "unrelated"
+            };
+            (progress.supplied_owner, progress.supplied_owner_type) =
+                super::super::owner_diagnostic_shape(
+                    reference
+                        .get("zoneID")
+                        .and_then(|scope| scope.get("ownerRecordName")),
+                );
+            if let Some(scope) = reference.get("zoneID") {
+                progress.scope_mismatch_component = if scope
+                    .get("zoneName")
+                    .is_none_or(|name| name.as_str() != Some(self.zone_name()))
+                {
+                    "zone_name"
+                } else if scope
+                    .get("ownerRecordName")
+                    .is_some_and(|owner| self.zone_id.get("ownerRecordName") != Some(owner))
+                {
+                    "owner"
+                } else {
+                    "not_applicable"
+                };
+            }
+            anyhow::ensure!(
+                reference.get("zoneID").is_none_or(|zone| {
+                    zone.get("zoneName")
+                        .is_some_and(|name| name.as_str() == Some(self.zone_name()))
+                        && zone
+                            .get("ownerRecordName")
+                            .is_none_or(|owner| self.zone_id.get("ownerRecordName") == Some(owner))
+                }),
+                InventoryFailureKind::Evidence("child_reference_scope_mismatch")
+            );
+            if masters.contains(master)
+                && record
+                    .fields
+                    .get("isDeleted")
+                    .and_then(|field| field.get("value"))
+                    .and_then(Value::as_i64)
+                    != Some(1)
+            {
+                expected.insert(record.record_name.clone());
+            }
+        }
+        // Compact unrelated records prove completeness only. Hydration must
+        // consume complete candidate-family records, never their projections.
+        progress.phase = "family_hydration";
+        progress.family_context = "candidate";
+        progress.child_soft_deleted = false;
+        progress.supplied_owner = "not_recorded";
+        progress.supplied_owner_type = "not_recorded";
+        progress.scope_mismatch_component = "not_applicable";
+        let family_records = latest
+            .into_values()
+            .map(|(record, _, _)| record)
+            .filter(|record| {
+                (record.record_type == "CPLMaster" && masters.contains(&record.record_name))
+                    || (record.record_type == "CPLAsset" && expected.contains(&record.record_name))
+            })
+            .collect();
+        let mut buffer = DeltaRecordBuffer::new();
+        let mut events = buffer.process_records(family_records);
+        events.extend(buffer.flush());
+        let mut children = Vec::new();
+        for event in events {
+            if !matches!(event.reason, ChangeReason::Created | ChangeReason::Hidden) {
+                continue;
+            }
+            if let Some(asset) = event.asset
+                && masters.contains(asset.id())
+            {
+                progress.phase = "capture_date";
+                anyhow::ensure!(
+                    asset.asset_date_evidence().is_some(),
+                    InventoryFailureKind::Evidence("capture_date_missing")
+                );
+                progress.phase = "family_hydration";
+                anyhow::ensure!(
+                    expected.remove(asset.asset_record_name()),
+                    InventoryFailureKind::Evidence("unexpected_child")
+                );
+                children.push(asset.with_source_zone(Arc::from(self.zone_name())));
+            }
+        }
+        progress.phase = "family_hydration";
+        anyhow::ensure!(
+            expected.is_empty(),
+            InventoryFailureKind::Evidence("family_hydration_incomplete")
+        );
+        children.sort_by(|a, b| a.asset_record_name().cmp(b.asset_record_name()));
+        Ok(CompleteLegacyInventory {
+            library: self.zone_name().to_owned(),
+            cursor,
+            children,
+        })
+    }
+
+    async fn scan_legacy_preservation_records(
+        &self,
+        masters: &FxHashSet<String>,
+        cancel: &CancellationToken,
+        budget: InventoryBudget,
+        progress: &mut LegacyInventoryDiagnostic,
+    ) -> anyhow::Result<RetainedLegacyInventory> {
         let url = format!(
             "{}/changes/zone?{}",
             self.service_endpoint,
@@ -450,138 +672,9 @@ impl PhotoAlbum {
             if zone.more_coming {
                 continue;
             }
-            let mut expected = FxHashSet::default();
-            for (record, _, observation) in latest.values().filter(|(record, _, _)| {
-                record.record_type == "CPLAsset" && record.deleted != Some(true)
-            }) {
-                progress.phase = "child_reference";
-                // A later sparse child must not inherit a previous child's scope.
-                progress.scope_mismatch_component = "not_applicable";
-                progress.supplied_owner = "not_recorded";
-                progress.supplied_owner_type = "not_recorded";
-                progress.family_context = "unknown";
-                progress.child_soft_deleted = record
-                    .fields
-                    .get("isDeleted")
-                    .and_then(|field| field.get("value"))
-                    .and_then(Value::as_i64)
-                    == Some(1);
-                let Some(reference) = record
-                    .fields
-                    .get("masterRef")
-                    .and_then(|field| field.get("value"))
-                else {
-                    self.observe_missing_reference(record, *observation, masters, cancel)
-                        .await;
-                    anyhow::bail!(InventoryFailureKind::Evidence(
-                        "child_master_reference_missing"
-                    ));
-                };
-                let master = reference
-                    .get("recordName")
-                    .and_then(Value::as_str)
-                    .filter(|id| !id.trim().is_empty())
-                    .context(InventoryFailureKind::Evidence(
-                        "child_master_identity_invalid",
-                    ))?;
-                progress.family_context = if masters.contains(master) {
-                    "candidate"
-                } else {
-                    "unrelated"
-                };
-                (progress.supplied_owner, progress.supplied_owner_type) =
-                    super::super::owner_diagnostic_shape(
-                        reference
-                            .get("zoneID")
-                            .and_then(|scope| scope.get("ownerRecordName")),
-                    );
-                if let Some(scope) = reference.get("zoneID") {
-                    progress.scope_mismatch_component = if scope
-                        .get("zoneName")
-                        .is_none_or(|name| name.as_str() != Some(self.zone_name()))
-                    {
-                        "zone_name"
-                    } else if scope
-                        .get("ownerRecordName")
-                        .is_some_and(|owner| self.zone_id.get("ownerRecordName") != Some(owner))
-                    {
-                        "owner"
-                    } else {
-                        "not_applicable"
-                    };
-                }
-                anyhow::ensure!(
-                    reference.get("zoneID").is_none_or(|zone| {
-                        zone.get("zoneName")
-                            .is_some_and(|name| name.as_str() == Some(self.zone_name()))
-                            && zone.get("ownerRecordName").is_none_or(|owner| {
-                                self.zone_id.get("ownerRecordName") == Some(owner)
-                            })
-                    }),
-                    InventoryFailureKind::Evidence("child_reference_scope_mismatch")
-                );
-                if masters.contains(master)
-                    && record
-                        .fields
-                        .get("isDeleted")
-                        .and_then(|field| field.get("value"))
-                        .and_then(Value::as_i64)
-                        != Some(1)
-                {
-                    expected.insert(record.record_name.clone());
-                }
-            }
-            // Compact unrelated records prove completeness only. Hydration must
-            // consume complete candidate-family records, never their projections.
-            progress.phase = "family_hydration";
-            progress.family_context = "candidate";
-            progress.child_soft_deleted = false;
-            progress.supplied_owner = "not_recorded";
-            progress.supplied_owner_type = "not_recorded";
-            progress.scope_mismatch_component = "not_applicable";
-            let family_records = latest
-                .into_values()
-                .map(|(record, _, _)| record)
-                .filter(|record| {
-                    (record.record_type == "CPLMaster" && masters.contains(&record.record_name))
-                        || (record.record_type == "CPLAsset"
-                            && expected.contains(&record.record_name))
-                })
-                .collect();
-            let mut buffer = DeltaRecordBuffer::new();
-            let mut events = buffer.process_records(family_records);
-            events.extend(buffer.flush());
-            let mut children = Vec::new();
-            for event in events {
-                if !matches!(event.reason, ChangeReason::Created | ChangeReason::Hidden) {
-                    continue;
-                }
-                if let Some(asset) = event.asset
-                    && masters.contains(asset.id())
-                {
-                    progress.phase = "capture_date";
-                    anyhow::ensure!(
-                        asset.asset_date_evidence().is_some(),
-                        InventoryFailureKind::Evidence("capture_date_missing")
-                    );
-                    progress.phase = "family_hydration";
-                    anyhow::ensure!(
-                        expected.remove(asset.asset_record_name()),
-                        InventoryFailureKind::Evidence("unexpected_child")
-                    );
-                    children.push(asset.with_source_zone(Arc::from(self.zone_name())));
-                }
-            }
-            progress.phase = "family_hydration";
-            anyhow::ensure!(
-                expected.is_empty(),
-                InventoryFailureKind::Evidence("family_hydration_incomplete")
-            );
-            children.sort_by(|a, b| a.asset_record_name().cmp(b.asset_record_name()));
-            return Ok(CompleteLegacyInventory {
-                library: self.zone_name().to_owned(),
+            return Ok(RetainedLegacyInventory {
                 cursor: cursor.context(InventoryFailureKind::Evidence("cursor_missing"))?,
-                children,
+                latest,
             });
         }
         progress.phase = "pagination";
@@ -955,5 +1048,76 @@ mod tests {
         for private in ["private-record", "secret.invalid", "private-token"] {
             assert!(!rendered.contains(private), "{rendered}");
         }
+    }
+    #[tokio::test]
+    async fn missing_reference_inventory_groups_every_shape_and_reports_omissions() {
+        let mut records = Vec::new();
+        for (marker_index, marker) in [
+            None,
+            Some(json!(true)),
+            Some(json!(false)),
+            Some(json!("private-marker")),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for linkage in [0, 1, 3] {
+                for prior in 0..3 {
+                    let name = format!("private-{marker_index}-{linkage}-{prior}");
+                    let mut record = changes_asset(&name, "master");
+                    record["fields"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("masterRef");
+                    if prior > 0 {
+                        records.push(if prior == 1 {
+                            changes_asset(&name, "master")
+                        } else {
+                            record.clone()
+                        });
+                    }
+                    if let Some(marker) = &marker {
+                        record["fields"]["isSparsePrivateRecord"] = json!({"value":marker});
+                    }
+                    for key in [
+                        "linkedShareRecordName",
+                        "linkedShareZoneName",
+                        "linkedShareZoneOwner",
+                    ]
+                    .iter()
+                    .take(linkage)
+                    {
+                        record["fields"][key] = json!({"value":"private-link"});
+                    }
+                    records.push(record);
+                }
+            }
+        }
+        let report = album(vec![canned_changes_page(&records, "private-cursor", false)])
+            .missing_reference_inventory(&CancellationToken::new())
+            .await;
+        assert_eq!(report["scan"], "eof_observed");
+        assert_eq!(report["missing_references"], 36);
+        assert_eq!(report["shown_groups"], 32);
+        assert_eq!(report["omitted_groups"], 4);
+        assert_eq!(report["omitted_observations"], 4);
+        let output = report.to_string();
+        assert!(!output.contains("private-"));
+        assert!(!output.contains("family"));
+        assert!(output.len() < 64 * 1024);
+    }
+
+    #[tokio::test]
+    async fn missing_reference_inventory_partial_or_cancelled_never_reports_eof() {
+        let partial = album(vec![canned_changes_page(&[], "private-cursor", true)])
+            .missing_reference_inventory(&CancellationToken::new())
+            .await;
+        assert_eq!(partial["scan"], "incomplete");
+        assert!(partial.get("groups").is_none());
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let cancelled = album(vec![]).missing_reference_inventory(&cancel).await;
+        assert_eq!(cancelled["scan"], "incomplete");
+        assert!(cancelled.get("lookup").is_none());
     }
 }

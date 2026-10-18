@@ -226,7 +226,7 @@ impl PhotoLibrary {
 
     /// Only the exact private primary from validated discovery can be published.
     /// Readiness is retained separately and never grants checkpoint authority.
-    pub(super) fn is_qualified_private_primary(&self) -> bool {
+    pub(crate) fn is_qualified_private_primary(&self) -> bool {
         self.library_type.as_ref() == "private"
             && self.zone_id.get("zoneName").and_then(Value::as_str) == Some(PRIMARY_ZONE_NAME)
             && super::has_explicit_owner(self.zone_id.get("ownerRecordName"))

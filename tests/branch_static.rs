@@ -2917,6 +2917,20 @@ fn docker_support_export_skips_repairs_and_keeps_numeric_privilege_drop() {
         (&["support-export", "--output"][..], false),
         (&["support-export", "--help"][..], true),
         (&["help", "support-export"][..], true),
+        (&["doctor", "--missing-reference-inventory"][..], false),
+        (
+            &["doctor", "--help", "--missing-reference-inventory"][..],
+            true,
+        ),
+        (
+            &[
+                "doctor",
+                "--live",
+                "--json",
+                "--missing-reference-inventory",
+            ][..],
+            false,
+        ),
     ] {
         let result = run(args);
         assert_eq!(result.status.success(), success, "{args:?}: {result:?}");

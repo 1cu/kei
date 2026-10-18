@@ -37,6 +37,7 @@ mod download;
 mod fs_util;
 mod health;
 mod icloud;
+mod inventory_diagnostic;
 mod metrics;
 mod notifications;
 mod password;
@@ -656,11 +657,11 @@ impl Drop for PidFileGuard {
 /// and any future companion binaries.
 pub fn main_inner() -> ExitCode {
     // Private packaging query: classify argv without credential resolution,
-    // runtime or configuration reads. Status 0 means export, 1 means ordinary
+    // runtime or configuration reads. Status 0 means an early read-only command, 1 means ordinary
     // command; unexpected process failure must stop wrapper initialization.
     if std::env::var_os("KEI_DOCKER_ENTRYPOINT_QUERY").as_deref() == Some(std::ffi::OsStr::new("1"))
     {
-        return if cli::is_support_export_invocation(std::env::args_os()) {
+        return if cli::is_early_read_only_invocation(std::env::args_os()) {
             ExitCode::SUCCESS
         } else {
             ExitCode::from(1)
@@ -730,6 +731,11 @@ async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Res
     // credentials, service hooks, or network-capable command dispatch.
     if let cli::Command::SupportExport(args) = &cli.command {
         return support::export(args.clone(), &cli.config).await;
+    }
+    if let cli::Command::Doctor(args) = &cli.command
+        && args.missing_reference_inventory
+    {
+        return inventory_diagnostic::run(std::path::Path::new(&cli.config)).await;
     }
     let config = load_startup_config(&cli)?;
     let output = resolve_startup_output(&cli, config.toml.as_ref());
@@ -1218,6 +1224,7 @@ mod tests {
         let err = load_startup_config(&cli).err().unwrap().to_string();
         assert!(err.contains("Failed to parse config file"));
         cli.command = Command::Doctor(cli::DoctorArgs {
+            missing_reference_inventory: false,
             json: true,
             live: false,
         });

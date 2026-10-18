@@ -47,6 +47,49 @@ pub enum DiagnosticLookupError {
     Malformed,
 }
 
+/// Privacy-safe streaming: no ordinary error logs or debug body dumps.
+pub(crate) async fn diagnostic_bytes(
+    client: &reqwest::Client,
+    url: &str,
+    body: String,
+    headers: &[(&str, &str)],
+    limit: usize,
+) -> Result<Vec<u8>, DiagnosticLookupError> {
+    let mut builder = client.post(url).body(body);
+    for &(key, value) in headers {
+        builder = builder.header(key, value);
+    }
+    let mut response = builder
+        .send()
+        .await
+        .map_err(|_private_error| DiagnosticLookupError::Request)?;
+    if !response.status().is_success() {
+        return Err(DiagnosticLookupError::HttpStatus);
+    }
+    if response
+        .headers()
+        .get(reqwest::header::CONTENT_ENCODING)
+        .is_some_and(|value| value != "identity")
+    {
+        return Err(DiagnosticLookupError::Malformed);
+    }
+    if response.content_length().is_some_and(|n| n > limit as u64) {
+        return Err(DiagnosticLookupError::TooLarge);
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_private_error| DiagnosticLookupError::Request)?
+    {
+        if chunk.len() > limit.saturating_sub(bytes.len()) {
+            return Err(DiagnosticLookupError::TooLarge);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
 const DIAGNOSTIC_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// Async HTTP session trait for the photos service.
@@ -122,34 +165,7 @@ impl PhotosSession for reqwest::Client {
         body: String,
         headers: &[(&str, &str)],
     ) -> Result<Value, DiagnosticLookupError> {
-        let mut builder = self.post(url).body(body);
-        for &(key, value) in headers {
-            builder = builder.header(key, value);
-        }
-        let mut response = builder
-            .send()
-            .await
-            .map_err(|_private_error| DiagnosticLookupError::Request)?;
-        if !response.status().is_success() {
-            return Err(DiagnosticLookupError::HttpStatus);
-        }
-        if response
-            .content_length()
-            .is_some_and(|n| n > DIAGNOSTIC_RESPONSE_BYTES as u64)
-        {
-            return Err(DiagnosticLookupError::TooLarge);
-        }
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_private_error| DiagnosticLookupError::Request)?
-        {
-            if chunk.len() > DIAGNOSTIC_RESPONSE_BYTES.saturating_sub(bytes.len()) {
-                return Err(DiagnosticLookupError::TooLarge);
-            }
-            bytes.extend_from_slice(&chunk);
-        }
+        let bytes = diagnostic_bytes(self, url, body, headers, DIAGNOSTIC_RESPONSE_BYTES).await?;
         serde_json::from_slice(&bytes).map_err(|_private_error| DiagnosticLookupError::Malformed)
     }
 
