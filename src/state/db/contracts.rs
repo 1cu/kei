@@ -600,6 +600,7 @@ pub trait DownloadStateStore: Send + Sync {
     ) -> Result<HashSet<(String, String, String)>, StateError> {
         Ok(HashSet::new())
     }
+    /// Deny set includes unprepared ambiguous masters; membership is not a preservation receipt.
     async fn get_protected_legacy_ids(&self) -> Result<HashSet<(String, String)>, StateError> {
         Ok(HashSet::new())
     }
@@ -966,6 +967,12 @@ pub trait MetadataRewriteStore: Send + Sync {
     /// Managed slots and ambiguous originals require their preservation owner.
     async fn guard_primary_writer(&self, _path: &Path) -> Result<(), StateError> {
         Ok(())
+    }
+
+    /// False identifies a known legacy hold; operational and primary guard failures remain errors.
+    async fn source_metadata_recovery_allowed(&self, path: &Path) -> Result<bool, StateError> {
+        self.guard_primary_writer(path).await?;
+        Ok(true)
     }
 
     /// Finalized current-child rows with verified source provenance or explicit

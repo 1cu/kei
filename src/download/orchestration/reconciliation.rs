@@ -140,10 +140,35 @@ pub(crate) async fn reconcile_catalog_paths_with_client(
     // Root drift can leave interrupted media or sidecar transactions outside
     // the newly configured tree. Restore them before planning reads the source.
     for record in &records {
-        if let Some(path) = &record.local_path
-            && db.guard_primary_writer(path).await.is_ok()
-            && let Err(error) = file::recover_metadata_replacements(path).await
-        {
+        let Some(path) = &record.local_path else {
+            continue;
+        };
+        match db.source_metadata_recovery_allowed(path).await {
+            Ok(false) => {
+                tracing::warn!(
+                    stage = "path_reconciliation",
+                    reason = "protected_legacy_source",
+                    "Deferring protected legacy source recovery"
+                );
+                continue;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    stage = "path_reconciliation",
+                    reason = "source_writer_guard_failed",
+                    "Could not authorize recorded source recovery; keeping catalogue paths and checkpoints unchanged"
+                );
+                return Ok(PathReconciliationResult {
+                    stats: SyncStats {
+                        failed: 1,
+                        ..SyncStats::default()
+                    },
+                    ..PathReconciliationResult::default()
+                });
+            }
+            Ok(true) => {}
+        }
+        if let Err(error) = file::recover_metadata_replacements(path).await {
             tracing::warn!(error = %format!("{error:#}"), "Could not recover recorded source; keeping catalogue paths and checkpoints unchanged");
             return Ok(PathReconciliationResult {
                 complete: false,
