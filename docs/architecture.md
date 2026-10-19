@@ -1888,6 +1888,15 @@ tombstones respect the protection before byte writes; SQL guards provide defense
 in depth. `reconcile` reports drift in protected originals without converting
 them into download retries. Verification and manifest export retain the original
 identities, dates, paths and history; download status does not establish ownership.
+Unprepared ambiguous originals use the same protection census, including supported
+relative paths and their exact sidecars. A connection-local SQLite TEMP cache
+indexes confined path keys; relevant identity and path changes invalidate it
+transactionally, and external commits, schema changes and working-directory
+changes require a fresh census. Ordinary writes and mapping timestamp refreshes
+do not rebuild it. This cache does not change durable preservation evidence.
+Source metadata recovery distinguishes protected legacy originals from healthy
+managed primary-layout sources. Managed sources continue through their layout
+owner; pending media or sidecar replacement journals still hold reconciliation.
 
 The final SQLite transaction compares the original snapshot, current child and
 family evidence, receipt generation, configuration metadata and prior cursor.

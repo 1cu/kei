@@ -33,6 +33,7 @@ use super::reconcile_catalog_paths;
 #[tokio::test]
 async fn path_reconciliation_source_guard_errors_stop_planning_and_protected_sources_keep_journals()
 {
+    use crate::state::db::provider_selection::SelectionPath;
     use sha2::{Digest, Sha256};
     use std::os::unix::ffi::OsStrExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -94,6 +95,13 @@ async fn path_reconciliation_source_guard_errors_stop_planning_and_protected_sou
             db.upsert_asset_master_mapping("PrimarySync", "other-child", "legacy-master")
                 .await
                 .unwrap();
+        }
+        if protected {
+            // Legacy protection wins even when a managed claim also fences this path.
+            db.acquire_lock("seed overlapping managed source claim").unwrap().execute(
+                "INSERT INTO primary_layout_claims(path_key,family,library,child,version,provider_checksum,native_path) VALUES(?1,'managed-family','PrimarySync','asset-legacy-master','original','provider-checksum',?2)",
+                rusqlite::params![crate::state::db::primary_layout::path_key(&source).unwrap(), serde_json::to_vec(&SelectionPath::from_path(&source)).unwrap()],
+            ).unwrap();
         }
         db.set_metadata("sync_token:PrimarySync", "before")
             .await

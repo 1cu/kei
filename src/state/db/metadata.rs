@@ -1400,11 +1400,21 @@ impl MetadataRewriteStore for SqliteStateDb {
         .await
     }
 
-    async fn source_metadata_recovery_allowed(&self, path: &Path) -> Result<bool, StateError> {
+    async fn source_metadata_recovery(
+        &self,
+        path: &Path,
+    ) -> Result<super::SourceMetadataRecovery, StateError> {
         let path = path.to_owned();
-        self.with_conn("source_metadata_recovery_allowed", move |conn| {
-            super::primary_layout::guard_writer(conn, &path)?;
-            Ok(!super::legacy_preservation::path_is_protected(conn, &path)?)
+        self.with_conn("source_metadata_recovery", move |conn| {
+            let managed = super::primary_layout::path_is_managed(conn, &path)?;
+            let protected = super::legacy_preservation::path_is_protected(conn, &path)?;
+            Ok(if protected {
+                super::SourceMetadataRecovery::ProtectedLegacy
+            } else if managed {
+                super::SourceMetadataRecovery::ManagedPrimary
+            } else {
+                super::SourceMetadataRecovery::Ordinary
+            })
         })
         .await
     }

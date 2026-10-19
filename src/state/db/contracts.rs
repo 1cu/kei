@@ -956,6 +956,14 @@ pub trait MembershipStore: Send + Sync {
     }
 }
 
+/// Owner of replacement recovery for a recorded catalog source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceMetadataRecovery {
+    Ordinary,
+    ProtectedLegacy,
+    ManagedPrimary,
+}
+
 /// Metadata rewrite markers and hashes.
 #[async_trait]
 pub trait MetadataRewriteStore: Send + Sync {
@@ -969,10 +977,13 @@ pub trait MetadataRewriteStore: Send + Sync {
         Ok(())
     }
 
-    /// False identifies a known legacy hold; operational and primary guard failures remain errors.
-    async fn source_metadata_recovery_allowed(&self, path: &Path) -> Result<bool, StateError> {
+    /// Classify recovery ownership without authorizing an ordinary writer.
+    async fn source_metadata_recovery(
+        &self,
+        path: &Path,
+    ) -> Result<SourceMetadataRecovery, StateError> {
         self.guard_primary_writer(path).await?;
-        Ok(true)
+        Ok(SourceMetadataRecovery::Ordinary)
     }
 
     /// Finalized current-child rows with verified source provenance or explicit

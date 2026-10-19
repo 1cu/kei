@@ -84,50 +84,17 @@ pub(super) fn protected_ids(
         .collect::<Result<_, _>>()?)
 }
 
+mod path_cache;
+
 pub(super) fn protected_paths(conn: &Connection) -> Result<Vec<PathBuf>, StateError> {
-    let mut stmt = conn.prepare(&format!(
-        "WITH ambiguous(library,id) AS ({AMBIGUOUS_MASTERS})
-        SELECT a.local_path FROM assets a JOIN ambiguous m USING(library,id) WHERE a.local_path IS NOT NULL
-        UNION SELECT p.local_path FROM asset_metadata_paths p JOIN ambiguous m USING(library,id)"
-    ))?;
-    let originals = stmt
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut paths = std::collections::HashSet::new();
-    for original in originals {
-        paths.insert(PathBuf::from(&original));
-        paths.insert(PathBuf::from(format!("{original}.xmp")));
-    }
-    let mut stmt = conn.prepare("SELECT local_path FROM unattributed_legacy_paths")?;
-    for path in stmt.query_map([], |row| row.get::<_, String>(0))? {
-        paths.insert(PathBuf::from(path?));
-    }
-    for path in &paths {
-        if !path.is_absolute() {
-            return Err(invalid());
-        }
-        crate::fs_util::confined_path_key(path).map_err(|_private_error| invalid())?;
-    }
-    Ok(paths.into_iter().collect())
+    path_cache::protected_paths(conn)
 }
 
 pub(super) fn path_is_protected(
     conn: &Connection,
     path: &std::path::Path,
 ) -> Result<bool, StateError> {
-    let key = crate::fs_util::confined_path_key(path).map_err(|_private_error| invalid())?;
-    let mut sidecar = path.as_os_str().to_os_string();
-    sidecar.push(".xmp");
-    let sidecar_key = crate::fs_util::confined_path_key(std::path::Path::new(&sidecar))
-        .map_err(|_private_error| invalid())?;
-    for protected in protected_paths(conn)? {
-        let protected_key =
-            crate::fs_util::confined_path_key(&protected).map_err(|_private_error| invalid())?;
-        if protected_key == key || protected_key == sidecar_key {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    path_cache::path_is_protected(conn, path)
 }
 
 pub(super) fn guard_writer(conn: &Connection, path: &std::path::Path) -> Result<(), StateError> {

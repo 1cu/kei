@@ -1423,11 +1423,11 @@ impl state::MetadataRewriteStore for FailingMetadataSetDb {
         self.inner.guard_primary_writer(path).await
     }
 
-    async fn source_metadata_recovery_allowed(
+    async fn source_metadata_recovery(
         &self,
         path: &std::path::Path,
-    ) -> Result<bool, crate::state::error::StateError> {
-        self.inner.source_metadata_recovery_allowed(path).await
+    ) -> Result<crate::state::db::SourceMetadataRecovery, crate::state::error::StateError> {
+        self.inner.source_metadata_recovery(path).await
     }
 
     async fn legacy_child_provenance(
