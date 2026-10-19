@@ -1410,6 +1410,19 @@ impl state::MembershipStore for FailingMetadataSetDb {
 
 #[async_trait::async_trait]
 impl state::MetadataRewriteStore for FailingMetadataSetDb {
+    async fn protected_legacy_paths(
+        &self,
+    ) -> Result<Vec<std::path::PathBuf>, crate::state::error::StateError> {
+        self.inner.protected_legacy_paths().await
+    }
+
+    async fn guard_primary_writer(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<(), crate::state::error::StateError> {
+        self.inner.guard_primary_writer(path).await
+    }
+
     async fn legacy_child_provenance(
         &self,
         library: &str,

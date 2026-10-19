@@ -958,7 +958,12 @@ pub trait MembershipStore: Send + Sync {
 /// Metadata rewrite markers and hashes.
 #[async_trait]
 pub trait MetadataRewriteStore: Send + Sync {
-    /// Managed slots are rewritten only by their preservation-backed layout owner.
+    /// Original media and exact sidecars protected before or after preparation.
+    async fn protected_legacy_paths(&self) -> Result<Vec<PathBuf>, StateError> {
+        Ok(Vec::new())
+    }
+
+    /// Managed slots and ambiguous originals require their preservation owner.
     async fn guard_primary_writer(&self, _path: &Path) -> Result<(), StateError> {
         Ok(())
     }

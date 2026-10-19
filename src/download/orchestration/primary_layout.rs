@@ -1065,13 +1065,30 @@ pub(in crate::download) async fn finish(
                 .map(SelectionPath::to_path)
                 .into_iter()
                 .chain(member.old.as_ref().map(|old| old.path.to_path()))
+                .chain(member.preserved_path.as_ref().map(SelectionPath::to_path))
+                .chain(member.retirement.as_ref().map(SelectionPath::to_path))
         })
         .collect();
     paths.sort();
     paths.dedup();
     let mut guards = Vec::new();
-    for path in paths {
-        guards.push(file::lock_download_destination(&path, cancel).await?);
+    for path in &paths {
+        guards.push(file::lock_download_destination(path, cancel).await?);
+    }
+    let protected: rustc_hash::FxHashSet<_> =
+        crate::download::legacy_preservation::protected_replacement_paths(Some(db))
+            .await?
+            .iter()
+            .map(|path| crate::fs_util::confined_path_key(path))
+            .collect::<std::io::Result<_>>()?;
+    for path in &paths {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(".xmp");
+        anyhow::ensure!(
+            !protected.contains(&crate::fs_util::confined_path_key(path)?)
+                && !protected.contains(&crate::fs_util::confined_path_key(Path::new(&sidecar))?),
+            "Primary layout overlaps protected legacy originals"
+        );
     }
 
     // Preserve every member before the first visible change, including sidecars.

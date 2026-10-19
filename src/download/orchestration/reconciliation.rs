@@ -141,6 +141,7 @@ pub(crate) async fn reconcile_catalog_paths_with_client(
     // the newly configured tree. Restore them before planning reads the source.
     for record in &records {
         if let Some(path) = &record.local_path
+            && db.guard_primary_writer(path).await.is_ok()
             && let Err(error) = file::recover_metadata_replacements(path).await
         {
             tracing::warn!(error = %format!("{error:#}"), "Could not recover recorded source; keeping catalogue paths and checkpoints unchanged");

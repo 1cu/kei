@@ -1792,8 +1792,17 @@ schema and never migrate it.
 
 Preparation protects the original catalogue rows, capture revisions, retry
 receipts, relationship history, media paths and sidecar presence. It preserves
-the old checkpoint. A complete unfiltered zone inventory must cover hidden
-children, all pages, an explicit completion marker and a nonblank final cursor.
+the old checkpoint. A valid original path already claimed by another catalogue
+asset defers that family without creating preservation receipts or changing its
+ownership, retries or checkpoint. Independent families in the same preparation
+scan can still progress; malformed evidence remains an error. Before preparation,
+unclaimed masters with multiple historical children already protect every
+catalogued original path and its exact `.xmp` sidecar across libraries. Pending
+metadata debt does not remove that protection. Ordinary writers, import adoption,
+publication proofs, layout handovers and replacement recovery share this path
+census; deferred originals retain their rewrite markers. A complete
+unfiltered zone inventory must cover hidden children, all pages, an explicit
+completion marker and a nonblank final cursor.
 Each scan is limited to 10,000 pages and 1,000,000 observed records. It retains
 compact latest identity/reference/deletion evidence for unrelated records and
 full latest records for candidate masters and children, then hydrates those

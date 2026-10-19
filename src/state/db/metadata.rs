@@ -1383,10 +1383,19 @@ impl SqliteStateDb {
 
 #[async_trait]
 impl MetadataRewriteStore for SqliteStateDb {
+    async fn protected_legacy_paths(&self) -> Result<Vec<std::path::PathBuf>, StateError> {
+        self.with_conn(
+            "protected_legacy_paths",
+            super::legacy_preservation::protected_paths,
+        )
+        .await
+    }
+
     async fn guard_primary_writer(&self, path: &Path) -> Result<(), StateError> {
         let path = path.to_owned();
         self.with_conn("guard_primary_writer", move |conn| {
-            super::primary_layout::guard_writer(conn, &path)
+            super::primary_layout::guard_writer(conn, &path)?;
+            super::legacy_preservation::guard_writer(conn, &path)
         })
         .await
     }
