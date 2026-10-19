@@ -27,6 +27,12 @@ pub(crate) struct PathReconciliationResult {
     pub(crate) stats: SyncStats,
 }
 
+fn classify_reconciliation_io_error(error: &anyhow::Error) -> Option<std::io::ErrorKind> {
+    error
+        .downcast_ref::<std::io::Error>()
+        .map(std::io::Error::kind)
+}
+
 async fn requeue_missing_catalog_file(
     db: &dyn DownloadStore,
     task: &DownloadTask,
@@ -184,9 +190,8 @@ pub(crate) async fn reconcile_catalog_paths_with_client(
                             Ok(false) => {}
                             // A moved old parent leaves no journal at this recorded path.
                             Err(error)
-                                if error.downcast_ref::<std::io::Error>().is_some_and(
-                                    |source| source.kind() == std::io::ErrorKind::NotFound,
-                                ) => {}
+                                if classify_reconciliation_io_error(&error)
+                                    == Some(std::io::ErrorKind::NotFound) => {}
                             Err(error) => return Err(error),
                         }
                     }
