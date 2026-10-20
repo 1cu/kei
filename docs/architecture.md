@@ -187,6 +187,10 @@ not-requested, returned, tombstoned and provider-error members without storing
 raw codes, messages or identifiers. `returned` describes response presence,
 not owner, identity, resource or checkpoint proof. Lookup resolution and
 checkpoint policy do not consume these diagnostic categories.
+`child_reference_status` separately describes a missing, malformed, sparse,
+matching or different reference, or an omitted, unavailable, invalid or
+unrequested child. These fixed labels expose no reference values and do not
+establish a usable pair.
 
 Best-effort album identity hydration has task-scoped anonymous progress in
 `icloud/photos/hydration_progress.rs`. Every 30 seconds and on return or drop,
@@ -889,7 +893,9 @@ record errors are distinguished from an explicit different-master reference.
 No owner or record value is emitted.
 
 A paired lookup can retain an inconclusive changed-master hint from a live,
-scoped child. Incremental asset hydration makes at most one additional paired
+scoped child, including when the old master explicitly returns `NOT_FOUND` or
+`UNKNOWN_ITEM`. An old-master tombstone or any other record error does not
+authorize a hint. Incremental asset hydration makes at most one additional paired
 lookup in that same scope during a normal download run. Dry-run and filename-only
 modes retain their prior held behavior. Only a complete current pair may update the mapping
 through the existing state owner. A missing or deleted redirected master,
@@ -2218,15 +2224,7 @@ to read first.
   `local_release.py` validates local live/host-service attestations.
   Release publication depends on both local evidence and hosted qualification;
   nightly runs cannot publish. See [CI qualification](ci.md).
-- `scripts/ci/opencode_review.py` owns the data-only advisory review
-  client. `opencode-review.yml` executes trusted base code and separates read-only
-  inference from deterministic COMMENT publication. Issue-open intake pins main and
-  issue content, runs independent product/code reviews, and publishes separate
-  advisory comments with stale-state and dedup checks. Code validation is static
-  inspection only. PR reviews submit the complete diff without local usage caps;
-  model capacity and Go allowance govern inference. Transport/job safeguards and
-  publication validation remain. GitHub 403/429 responses stop the operation
-  without automatic retry. See [review security and setup](opencode-review.md).
+- `scripts/ci/opencode_review.py` owns the data-only advisory review client. PR review requires a new standalone `/opencode review` comment from a human with API-verified repository write access, or explicit default-branch dispatch. Requests pin the current PR head; per-PR publication serialization and head markers suppress duplicates. `opencode-review.yml` executes trusted default-branch code and separates read-only inference from deterministic COMMENT publication. Issue-open intake pins main and issue content, runs independent product/code reviews, and publishes separate advisory comments with stale-state and dedup checks. Code validation is static inspection only. PR reviews submit the complete diff without local usage caps; model capacity and Go allowance govern inference. Transport/job safeguards and publication validation remain. GitHub 403/429 responses stop the operation without automatic retry. See [review security and setup](opencode-review.md).
 - `justfile` owns local script and workflow lint commands. Protected CI runs
   the same shellcheck, shfmt, ruff, and actionlint checks with pinned versions.
 

@@ -8,7 +8,7 @@ import os
 import tempfile
 import unittest
 import urllib.error
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from http.client import IncompleteRead
 from pathlib import Path
 from unittest.mock import patch
@@ -35,6 +35,7 @@ class FakeHTTP:
         self.prs = []
         self.files = [copy.deepcopy(FILE)]
         self.reviews = []
+        self.permission = {"permission": "write"}
         self.source = {"type": "file", "encoding": "base64", "sha": FILE["sha"],
                        "size": len(SOURCE), "content": base64.b64encode(SOURCE).decode()}
         self.completion = {"choices": [{"finish_reason": "stop", "message": {
@@ -46,6 +47,8 @@ class FakeHTTP:
             return self.completion
         if method == "POST":
             return {"id": 1}
+        if "/collaborators/" in url:
+            return copy.deepcopy(self.permission)
         if "/reviews?" in url:
             return copy.deepcopy(self.reviews)
         if "/files?" in url:
@@ -72,6 +75,19 @@ def result():
 def bot_review():
     return {"user": {"login": "github-actions[bot]", "type": "Bot"}, "state": "COMMENTED",
             "commit_id": HEAD, "body": f"{review.MARKER}{HEAD} -->\nReview"}
+
+
+def comment_event():
+    return {"action": "created", "issue": {"number": 123, "pull_request": {"url": "fixture"}},
+            "comment": {"id": 42, "body": "/opencode review",
+                        "user": {"login": "maintainer", "type": "User"}, "author_association": "NONE"},
+            "repository": {"full_name": REPO, "default_branch": "main"}}
+
+
+def ok_response(payload):
+    response = io.BytesIO(payload if isinstance(payload, bytes) else review.json_bytes(payload))
+    response.status = 200
+    return response
 
 
 class ReviewTests(unittest.TestCase):
@@ -164,8 +180,9 @@ class ReviewTests(unittest.TestCase):
     def test_provider_failures_advance_once_and_all_failed_has_no_result(self):
         for failure in (review.ProviderHTTPError(400), review.ProviderHTTPError(401),
                         review.ProviderHTTPError(403), review.ProviderHTTPError(429),
-                        review.ProviderHTTPError(503), review.ProviderError("uncertain transport"),
-                        review.ProviderError("malformed JSON"), review.ProviderError("response size")):
+                        review.ProviderHTTPError(503), review.ProviderError("timeout"),
+                        review.ProviderError("transport"), review.ProviderError("malformed_json"),
+                        review.ProviderError("response_too_large")):
             http = FakeHTTP()
             data = prepared(http)
             output = io.StringIO()
@@ -255,6 +272,13 @@ class ReviewTests(unittest.TestCase):
             self.assertIsNone(metadata[field])
         for text in (KEY, "not logged", "never logged", "::error::"):
             self.assertNotIn(text, output.getvalue())
+        for failure in (KEY, "http_error", "malformed JSON"):
+            with self.assertRaises(review.ReviewError):
+                review.attempt_metadata(http, "go", review.DEFAULT_MODEL, "request_failed",
+                                        failure=failure)
+        for category in (KEY, "malformed JSON", "response size"):
+            with self.assertRaises(review.ReviewError):
+                review.ProviderError(category)
 
     def test_stable_session_per_head(self):
         http = FakeHTTP()
@@ -515,8 +539,8 @@ class ReviewTests(unittest.TestCase):
         output["findings"] = []
         self.assertIn("No supported findings in the supplied diff", review.review_body(output))
 
-    def test_cli_end_to_end_with_mocked_apis(self):
-        event = {"number": 123, "pull_request": copy.deepcopy(PR)}
+    def test_comment_cli_end_to_end_with_mocked_apis(self):
+        event = comment_event()
         http = FakeHTTP()
         with tempfile.TemporaryDirectory() as tmp:
             previous = Path.cwd()
@@ -525,7 +549,7 @@ class ReviewTests(unittest.TestCase):
                 Path("event.json").write_text(json.dumps(event))
                 env = {"GITHUB_EVENT_PATH": str(Path("event.json").resolve()),
                        "GITHUB_REPOSITORY": REPO, "GITHUB_OUTPUT": "output",
-                       "GITHUB_EVENT_NAME": "pull_request_target",
+                       "GITHUB_EVENT_NAME": "issue_comment", "GITHUB_REF": "refs/heads/main",
                        "GH_TOKEN": "fixture-github-token"}
                 with patch.dict(os.environ, env, clear=True), patch.object(review, "HTTP", return_value=http), \
                      patch("sys.argv", ["review", "prepare"]), redirect_stdout(io.StringIO()):
@@ -542,12 +566,112 @@ class ReviewTests(unittest.TestCase):
                 self.assertNotIn("fixture-github-token", output)
                 Path("result").mkdir()
                 Path("review-result.json").rename("result/review-result.json")
-                with patch.dict(os.environ, env, clear=True), patch.object(review, "HTTP", return_value=http), \
+                with patch.dict(os.environ, dict(env, EXPECTED_HEAD_SHA=HEAD), clear=True), \
+                     patch.object(review, "HTTP", return_value=http), \
                      patch("sys.argv", ["review", "publish"]), redirect_stdout(io.StringIO()):
                     review.main()
                 self.assertEqual(http.calls[-1][3]["payload"]["event"], "COMMENT")
+                self.assertEqual(sum("/collaborators/maintainer/permission" in c[1] for c in http.calls), 2)
+                # Re-delivery or another command on the same head cannot publish again.
+                http.reviews = [bot_review()]
+                with patch.dict(os.environ, dict(env, EXPECTED_HEAD_SHA=HEAD), clear=True), \
+                     patch.object(review, "HTTP", return_value=http), \
+                     patch("sys.argv", ["review", "publish"]), self.assertRaises(review.Skip):
+                    review.main()
+                for _ in range(2):
+                    with patch.dict(os.environ, env, clear=True), patch.object(review, "HTTP", return_value=http), \
+                         patch("sys.argv", ["review", "prepare"]), self.assertRaises(review.Skip):
+                        review.main()
+                self.assertEqual(sum(c[0] == "POST" and "/reviews" in c[1] for c in http.calls), 1)
             finally:
                 os.chdir(previous)
+
+    def test_comment_admission_rejects_spoofs_before_network(self):
+        cases = []
+        for body in ("ordinary comment", "> /opencode review", "```\n/opencode review\n```",
+                     "/opencode review please", "please /opencode review", "/OpenCode review",
+                     "/opencode review\nextra", "/opencode\u200b review", None):
+            event = comment_event()
+            event["comment"]["body"] = body
+            cases.append(event)
+        for action in ("edited", "deleted", None):
+            cases.append(dict(comment_event(), action=action))
+        event = comment_event()
+        event["issue"].pop("pull_request")
+        cases.append(event)
+        for kind in ("Bot", "Mannequin", None):
+            event = comment_event()
+            event["comment"]["user"]["type"] = kind
+            cases.append(event)
+        env = {"GITHUB_REPOSITORY": REPO, "GITHUB_EVENT_NAME": "issue_comment",
+               "GITHUB_REF": "refs/heads/main", "GH_TOKEN": "fixture-github-token"}
+        for event in cases:
+            http = FakeHTTP()
+            with self.subTest(event=event), patch.dict(os.environ, env, clear=True), \
+                 self.assertRaises(review.Skip):
+                review.review_target(http, event, "prepare")
+            self.assertEqual(http.calls, [])
+
+    def test_comment_permission_lookup_overrides_association_and_fails_closed(self):
+        env = {"GITHUB_REPOSITORY": REPO, "GITHUB_EVENT_NAME": "issue_comment",
+               "GITHUB_REF": "refs/heads/main", "GH_TOKEN": "fixture-github-token",
+               "EXPECTED_HEAD_SHA": HEAD}
+        for permission in ("write", "maintain", "admin", "read", "triage", "none", "", None):
+            for mode in ("prepare", "publish"):
+                http = FakeHTTP()
+                http.permission = {"permission": permission}
+                event = comment_event()
+                event["comment"]["body"] = " \n/opencode review\t "
+                event["comment"]["author_association"] = "OWNER"
+                with self.subTest(permission=permission, mode=mode), patch.dict(os.environ, env, clear=True):
+                    if permission in {"write", "maintain", "admin"}:
+                        self.assertEqual(review.review_target(http, event, mode)[1], HEAD)
+                    else:
+                        with self.assertRaises(review.Skip):
+                            review.review_target(http, event, mode)
+                        self.assertEqual(len(http.calls), 1)
+                self.assertTrue(http.calls[0][1].endswith("/collaborators/maintainer/permission"))
+        for mode in ("prepare", "publish"):
+            http = FakeHTTP()
+            with patch.dict(os.environ, env, clear=True), \
+                 patch.object(http, "request", side_effect=review.ReviewError("access denied")) as request, \
+                 self.assertRaises(review.ReviewError):
+                review.review_target(http, comment_event(), mode)
+            self.assertEqual(request.call_count, 1)
+
+    def test_comment_publish_uses_prepared_head_and_rejects_moved_head(self):
+        event = comment_event()
+        env = {"GITHUB_REPOSITORY": REPO, "GITHUB_EVENT_NAME": "issue_comment",
+               "GITHUB_REF": "refs/heads/main", "GH_TOKEN": "fixture-github-token",
+               "EXPECTED_HEAD_SHA": HEAD}
+        http = FakeHTTP()
+        stale = copy.deepcopy(PR)
+        stale["head"]["sha"] = OLD
+        http.prs = [stale, stale]
+        http.reviews = [bot_review()]
+        with patch.dict(os.environ, env, clear=True):
+            # A new command resolves today's head even if an older head was reviewed.
+            target, head = review.review_target(http, event, "prepare")
+            self.assertEqual(head, OLD)
+            target.current(head)
+            self.assertFalse(target.duplicate(head))
+            http.prs = [stale]
+            target, head = review.review_target(http, event, "publish")
+            self.assertEqual(head, HEAD)
+            with self.assertRaises(review.Skip):
+                review.publish(target, result(), head)
+        self.assertFalse(any(c[0] == "POST" for c in http.calls))
+        for name, ref, repository in (("pull_request_target", "refs/heads/main", REPO),
+                                      ("pull_request", "refs/heads/main", REPO),
+                                      ("issue_comment", "refs/heads/feature", REPO),
+                                      ("issue_comment", "refs/heads/main", "evil/repo")):
+            http = FakeHTTP()
+            event = comment_event()
+            event["repository"]["full_name"] = repository
+            with patch.dict(os.environ, dict(env, GITHUB_EVENT_NAME=name, GITHUB_REF=ref), clear=True), \
+                 self.assertRaises(review.ReviewError):
+                review.review_target(http, event, "prepare")
+            self.assertEqual(http.calls, [])
 
     def test_manual_dispatch_full_pipeline_preserves_prepared_head(self):
         event = {"inputs": {"pr_number": "123"},
@@ -653,17 +777,19 @@ class ReviewTests(unittest.TestCase):
 
     def test_prepare_cli_draft_and_duplicate_never_enable_inference(self):
         for draft in (True, False):
-            event = {"number": 123, "pull_request": copy.deepcopy(PR)}
-            event["pull_request"]["draft"] = draft
+            event = comment_event()
+            item = copy.deepcopy(PR)
+            item["draft"] = draft
             http = FakeHTTP()
             http.reviews = [bot_review()]
+            http.prs = [item]
             with tempfile.TemporaryDirectory() as tmp:
                 event_path = Path(tmp) / "event.json"
                 out = Path(tmp) / "output"
                 event_path.write_text(json.dumps(event))
                 with patch.dict(os.environ, {"GITHUB_EVENT_PATH": str(event_path),
                                              "GITHUB_REPOSITORY": REPO, "GITHUB_OUTPUT": str(out),
-                                             "GITHUB_EVENT_NAME": "pull_request_target",
+                                             "GITHUB_EVENT_NAME": "issue_comment", "GITHUB_REF": "refs/heads/main",
                                              "GH_TOKEN": "fixture-github-token"}), \
                      patch.object(review, "HTTP", return_value=http), \
                      patch("sys.argv", ["opencode_review.py", "prepare"]), redirect_stdout(io.StringIO()), \
@@ -710,7 +836,82 @@ class TransportTests(unittest.TestCase):
             self.assertEqual(req.get_header("Authorization"), f"Bearer {KEY}")
             self.assertEqual(req.get_header("User-agent"), "kei-advisory-review/1.0")
             self.assertEqual(req.get_header("X-opencode-session"), "fixture")
-            self.assertEqual(opened.call_args.kwargs["timeout"], 240)
+            self.assertIsNone(opened.call_args.kwargs["timeout"])
+        with patch.object(client.opener, "open", return_value=ok_response({})) as opened:
+            self.assertEqual(client.request("GET", "https://api.github.com/test", KEY), {})
+            self.assertEqual(opened.call_args.kwargs["timeout"], 20)
+
+    def test_provider_failure_categories_reach_diagnostics_and_fallback(self):
+        fixture = FakeHTTP()
+        data = prepared(fixture)
+        private_body = "private-provider-body"
+        malformed = ok_response(private_body.encode())
+        oversized = ok_response(private_body.encode() + b"x" * 1025)
+        cases = (
+            ("timeout", TimeoutError(private_body)),
+            ("timeout", urllib.error.URLError(TimeoutError(private_body))),
+            ("transport", urllib.error.URLError(private_body)),
+            ("transport", OSError(private_body)),
+            ("transport", IncompleteRead(b"partial " + private_body.encode(), 100)),
+            ("malformed_json", malformed),
+            ("response_too_large", oversized),
+        )
+        for category, failure in cases:
+            with self.subTest(category=category, failure=type(failure).__name__):
+                client = review.HTTP()
+                output = io.StringIO()
+                with patch.object(client.opener, "open",
+                                  side_effect=[failure, ok_response(fixture.completion)]) as opened, \
+                     patch.object(review, "HTTP_RESPONSE_LIMIT", 1024), redirect_stdout(output):
+                    result = review.infer(client, data, KEY, review.DEFAULT_MODEL,
+                                          go_no_overage_confirmed=True)
+                self.assertEqual(opened.call_count, 2)
+                self.assertIsNone(opened.call_args.kwargs["timeout"])
+                self.assertEqual(result["model"], "glm-5.3-flash")
+                lines = [json.loads(line.removeprefix("OpenCode attempt "))
+                         for line in output.getvalue().splitlines()]
+                self.assertEqual([line["outcome"] for line in lines],
+                                 ["request_failed", "accepted"])
+                self.assertEqual([line["failure"] for line in lines], [category, None])
+                self.assertNotIn(private_body, output.getvalue())
+                self.assertNotIn(KEY, output.getvalue())
+
+    def test_both_provider_failures_via_real_request_write_no_artifact(self):
+        fixture = FakeHTTP()
+        data = prepared(fixture)
+        private_body = "private-provider-body"
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = Path.cwd()
+            os.chdir(tmp)
+            try:
+                Path("review-input.json").write_text(json.dumps(data))
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with patch.object(review.urllib.request, "build_opener") as build, \
+                     patch.object(review, "publish") as publish, \
+                     patch.dict(os.environ, {"OPENCODE_API_KEY": KEY,
+                                             "OPENCODE_GO_NO_OVERAGE_CONFIRMED": "true"}, clear=True), \
+                     patch("sys.argv", ["review", "infer"]), \
+                     redirect_stdout(stdout), redirect_stderr(stderr), \
+                     self.assertRaisesRegex(review.ReviewError, "Both OpenCode Go") as caught:
+                    build.return_value.open.side_effect = [
+                        urllib.error.URLError(TimeoutError(private_body)),
+                        urllib.error.URLError(private_body),
+                    ]
+                    review.main()
+                self.assertEqual(build.return_value.open.call_count, 2)
+                publish.assert_not_called()
+                self.assertEqual([path.name for path in Path(".").iterdir()],
+                                 ["review-input.json"])
+                self.assertEqual(str(caught.exception),
+                                 "Both OpenCode Go models failed; no review completed or published.")
+                lines = [json.loads(line.removeprefix("OpenCode attempt "))
+                         for line in stdout.getvalue().splitlines()]
+                self.assertEqual([line["failure"] for line in lines], ["timeout", "transport"])
+                combined = stdout.getvalue() + stderr.getvalue() + str(caught.exception)
+                self.assertNotIn(private_body, combined)
+                self.assertNotIn(KEY, combined)
+            finally:
+                os.chdir(previous)
 
     def test_provider_errors_expose_only_fixed_route_and_numeric_status(self):
         for route, url, code in (("go", review.GO_URL, 401), ("go", review.GO_URL, 429)):
@@ -852,9 +1053,16 @@ class PlainTextRenderingTests(unittest.TestCase):
 class WorkflowTests(unittest.TestCase):
     def test_workflow_security_contract(self):
         text = (Path(__file__).resolve().parents[2] / ".github/workflows/opencode-review.yml").read_text()
-        self.assertIn("types: [opened, synchronize, reopened, ready_for_review]", text)
-        self.assertIn("github.event.pull_request.draft == false", text)
-        self.assertIn("cancel-in-progress: true", text)
+        self.assertIn("  issue_comment:\n    types: [created]", text)
+        self.assertNotIn("  pull_request_target:", text)
+        self.assertNotIn("  pull_request:", text)
+        self.assertIn("github.event.issue.pull_request", text)
+        self.assertIn("github.event.comment.user.type == 'User'", text)
+        self.assertIn("contains(github.event.comment.body, '/opencode review')", text)
+        self.assertIn("github.event.comment.id || inputs.pr_number", text)
+        self.assertIn("cancel-in-progress: ${{ github.event_name == 'issues' }}", text)
+        self.assertIn("group: opencode-go-publish-pr-${{ inputs.pr_number || github.event.issue.number }}", text)
+        self.assertIn("cancel-in-progress: false", text)
         self.assertIn("permissions: {}", text)
         self.assertIn("  workflow_dispatch:", text)
         self.assertIn("      pr_number:", text)
@@ -862,7 +1070,6 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("smoke_route", text)
         self.assertNotIn("inputs.mode", text)
         self.assertIn("github.ref == format('refs/heads/{0}', github.event.repository.default_branch)", text)
-        self.assertIn("github.event.pull_request.number || inputs.pr_number", text)
         self.assertIn("EXPECTED_HEAD_SHA: ${{ needs.review.outputs.head }}", text)
         text = text.split("  # Pin identities once", 1)[0]
         self.assertEqual(text.count("ref: ${{ github.workflow_sha }}"), 2)
@@ -1365,7 +1572,7 @@ class ConciseReviewTests(unittest.TestCase):
 class IssueWorkflowTests(unittest.TestCase):
     def test_independent_fail_safe_job_contract(self):
         text = (Path(__file__).resolve().parents[2] / ".github/workflows/opencode-review.yml").read_text()
-        trigger = text.split("  issues:\n")[1].split("  pull_request_target:")[0]
+        trigger = text.split("  issues:\n")[1].split("  issue_comment:")[0]
         self.assertEqual(trigger.strip(), "types: [opened]")
         pin, reader = text.split("  issue-pin:\n")[1].split("  issue-review:\n")
         reader, publisher = reader.split("  issue-publish:\n")
