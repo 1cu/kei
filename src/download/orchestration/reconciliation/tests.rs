@@ -208,6 +208,169 @@ async fn path_reconciliation_source_guard_errors_stop_planning_and_protected_sou
     }
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn path_reconciliation_missing_protected_parent_preserves_legacy_debt_across_reopens() {
+    fn snapshot(db: &SqliteStateDb) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+        let conn = db
+            .acquire_lock("snapshot protected legacy evidence")
+            .unwrap();
+        [
+            "SELECT * FROM assets WHERE id <> 'SAFE' ORDER BY library,id,version_size",
+            "SELECT * FROM asset_master_mappings ORDER BY library,asset_record_name",
+            "SELECT * FROM legacy_master_state_owners ORDER BY library,master_record_name",
+            "SELECT * FROM metadata_capture_retries ORDER BY library,asset_id,target_revision",
+            "SELECT * FROM metadata ORDER BY key",
+        ]
+        .into_iter()
+        .map(|sql| {
+            let mut statement = conn.prepare(sql).unwrap();
+            let columns = statement.column_count();
+            statement
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        })
+        .collect()
+    }
+
+    for library in ["PrimarySync", "SharedSync"] {
+        for changed_root in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let database = dir.path().join("state.db");
+            let db = Arc::new(SqliteStateDb::open(&database).await.unwrap());
+            let old_root = dir.path().join("old");
+            let source = old_root.join("legacy/source.jpg");
+            std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+            let bytes = vec![3u8; 1024];
+            std::fs::write(&source, &bytes).unwrap();
+            std::fs::write(source.with_file_name("source.jpg.xmp"), b"retained sidecar").unwrap();
+            let checksum = file::compute_sha256(&source).await.unwrap();
+            for id in ["asset-legacy-master", "legacy-master"] {
+                db.upsert_seen(
+                    &TestAssetRecord::new(id)
+                        .library(library)
+                        .filename("source.jpg")
+                        .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+                        .size(1024)
+                        .build(),
+                )
+                .await
+                .unwrap();
+                db.mark_downloaded(library, id, "original", &source, &checksum, None)
+                    .await
+                    .unwrap();
+            }
+            for child in ["asset-legacy-master", "other-child"] {
+                db.upsert_asset_master_mapping(library, child, "legacy-master")
+                    .await
+                    .unwrap();
+            }
+            db.set_metadata(&format!("sync_token:{library}"), "before")
+                .await
+                .unwrap();
+            db.set_metadata("config_hash", "before-root-change")
+                .await
+                .unwrap();
+            db.acquire_lock("seed retained legacy retry debt")
+                .unwrap()
+                .execute(
+                    "INSERT INTO metadata_capture_retries VALUES (?1,'legacy-master',1,'retained retry evidence',8,4,10,20)",
+                    [library],
+                )
+                .unwrap();
+            let retained = dir.path().join("retained");
+            std::fs::rename(source.parent().unwrap(), &retained).unwrap();
+            assert!(!source.parent().unwrap().exists());
+
+            let safe_source = dir.path().join("safe-source.jpg");
+            std::fs::write(&safe_source, &bytes).unwrap();
+            db.upsert_seen(
+                &TestAssetRecord::new("SAFE")
+                    .filename("safe.JPG")
+                    .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+                    .size(1024)
+                    .build(),
+            )
+            .await
+            .unwrap();
+            db.mark_downloaded(
+                "PrimarySync",
+                "SAFE",
+                "original",
+                &safe_source,
+                &checksum,
+                None,
+            )
+            .await
+            .unwrap();
+            db.upsert_asset_master_mapping("PrimarySync", "asset-SAFE", "SAFE")
+                .await
+                .unwrap();
+            let before = snapshot(&db);
+            let passes = vec![AlbumPass {
+                kind: PassKind::Unfiled,
+                album: album_with_session(
+                    "PrimarySync",
+                    "",
+                    Box::new(PendingLookupSession {
+                        records: Arc::new(mock_photo_records_for_zone_with_filename(
+                            "SAFE",
+                            "PrimarySync",
+                            "safe.JPG",
+                        )),
+                    }),
+                ),
+                exclude_ids: Default::default(),
+            }];
+            let mut config = test_config();
+            config.directory = Arc::from(if changed_root {
+                dir.path().join("new")
+            } else {
+                old_root
+            });
+            std::fs::create_dir_all(&config.directory).unwrap();
+            config.folder_structure = "none".into();
+            drop(db);
+            for run in 0..3 {
+                let db = Arc::new(SqliteStateDb::open(&database).await.unwrap());
+                config.state_db = Some(db.clone());
+                let result = reconcile_catalog_paths(
+                    &passes,
+                    Arc::new(config.clone()),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    result.complete,
+                    library != "PrimarySync",
+                    "selected unresolved source keeps its hold; {library}, changed_root={changed_root}"
+                );
+                assert_eq!(result.stats.failed, 0);
+                assert_eq!(result.stats.downloaded, usize::from(run == 0));
+                assert_eq!(snapshot(&db), before);
+                assert_eq!(
+                    std::fs::read(config.directory.join("safe.JPG")).unwrap(),
+                    bytes
+                );
+                assert_eq!(std::fs::read(retained.join("source.jpg")).unwrap(), bytes);
+                assert_eq!(
+                    std::fs::read(retained.join("source.jpg.xmp")).unwrap(),
+                    b"retained sidecar"
+                );
+                assert!(!source.parent().unwrap().exists());
+                config.state_db = None;
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn import_refusal_preserves_reserved_retry_across_restart() {
     use base64::Engine as _;

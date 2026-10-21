@@ -708,10 +708,30 @@ fn recover_tree_blocking_with_protection(
         let parent = journal
             .parent()
             .context("Protected replacement has no parent")?;
-        // Fail closed on missing/changed parents. This also resolves aliases of
-        // the trusted root before comparing with recovery's canonical paths.
+        // Keep absent suffixes reserved while resolving existing root aliases.
+        let mut ancestor = crate::fs_util::absolute_confined_path(parent)?;
+        let mut missing = PathBuf::new();
+        let resolved = loop {
+            match std::fs::canonicalize(&ancestor) {
+                Ok(existing) => break existing.join(&missing),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    match std::fs::symlink_metadata(&ancestor) {
+                        Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {}
+                        _ => return Err(error.into()),
+                    }
+                    missing = PathBuf::from(
+                        ancestor
+                            .file_name()
+                            .context("Protected replacement has no ancestor")?,
+                    )
+                    .join(missing);
+                    ancestor.pop();
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
         protected_journals.insert(
-            std::fs::canonicalize(parent)?.join(
+            resolved.join(
                 journal
                     .file_name()
                     .context("Protected replacement has no name")?,
